@@ -74,7 +74,7 @@
   "_comment_risk": "sizing_ratio_start / sizing_ratio_increment_table drive the sizing multiplier between mediation levels: level 1 is always the base unit; the ratio used for the step from one level to the next starts at sizing_ratio_start, then after each step is bumped by that step's own entry in sizing_ratio_increment_table (entry i = the increment applied after step i). Once past the table's length, every further step reuses the table's LAST entry forever -- same convention as grid_step_table_pct. Current table [0.20,0.30,0.40,0.50,0.60,0.70,0.80,0.90,1.00]: entry i is labeled 'level i+2' (the increment that kicks in once that level is reached, affecting the NEXT step) -- reaching level 2 adds +0.20 (making step 2->3 use 1.70), level 3 adds +0.30 (step 3->4 = 2.00), ... level 10 adds +1.00 (step 10->11 = 6.90), which then repeats forever past level 10. With start=1.50: step ratios 1.50, 1.70, 2.00, 2.40, 2.90, 3.50, 4.20, 5.00, 5.90, 6.90, 7.90, ... Leave the table as [] for a plain constant-ratio geometric progression (ratio_start ** (n-1)) instead. Replaces the old true-Fibonacci-sequence sizing (whose own ratio isn't constant, it only approaches ~1.618 for large levels).",
   "risk": {
     "max_fib_level": 200,
-    "sizing_ratio_start": 5.0,
+    "sizing_ratio_start": 10.0,
     "sizing_ratio_increment_table": []
   },
 
