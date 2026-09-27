@@ -333,7 +333,7 @@ class GridBotOrchestrator:
         base_notional = self._effective_base_notional(mark_price)
         order = PlannedOrder(
             range_offset=0, fib_n=1,
-            notional_usdt=level_multiplier(1, self.cfg.sizing_ratio_start, self.cfg.sizing_ratio_increment)
+            notional_usdt=level_multiplier(1, self.cfg.sizing_ratio_start, self.cfg.sizing_ratio_increment_table)
             * base_notional,
             kind=kind,
         )
@@ -515,7 +515,7 @@ class GridBotOrchestrator:
         breakeven_price = None if self.position.is_flat else self.position.avg_entry_price
         base_notional = self._effective_base_notional(price)
         order = evaluate_grid_close(price, self.grid, base_notional, max_fib_level,
-                                     self.cfg.sizing_ratio_start, self.cfg.sizing_ratio_increment,
+                                     self.cfg.sizing_ratio_start, self.cfg.sizing_ratio_increment_table,
                                      breakeven_price)
         if order is None:
             logger.debug(

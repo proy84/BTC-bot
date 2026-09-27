@@ -53,7 +53,7 @@ import os
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from dotenv import load_dotenv
 
@@ -103,29 +103,35 @@ def fibonacci(n: int) -> int:
 
 
 @lru_cache(maxsize=None)
-def level_multiplier(n: int, ratio_start: float, ratio_increment: float) -> float:
+def level_multiplier(n: int, ratio_start: float, ratio_increment_table: Tuple[float, ...]) -> float:
     """Sizing multiplier for level `n` (1-indexed, same numbering as the old
     `fibonacci(n)`): level 1 is always exactly the base unit. From there,
-    each step to the NEXT level uses its own ratio, which itself grows by
-    `ratio_increment` every step, starting at `ratio_start`: step 1->2 uses
-    `ratio_start`, step 2->3 uses `ratio_start + ratio_increment`, step 3->4
-    uses `ratio_start + 2*ratio_increment`, and so on. The multiplier is the
-    cumulative product of all those step ratios up to level `n`.
+    each step to the NEXT level uses its own ratio, starting at `ratio_start`
+    for the very first step (1->2). After each step, the ratio is bumped by
+    that step's own entry in `ratio_increment_table` (entry i = the increment
+    applied AFTER step i, i.e. `ratio_increment_table[0]` is added once
+    step 1->2 has been used, to get step 2->3's ratio). Once `n` goes past
+    the table's length, every further step reuses the table's LAST entry --
+    same "table then flat forever" convention as `grid_step_table_pct`. An
+    empty table means increment=0 always (plain constant-ratio geometric
+    progression, `ratio_start ** (n - 1)`).
 
-    Example (ratio_start=1.60, ratio_increment=0.50): level 1=1.00,
-    level 2=1.60 (x1.60), level 3=3.36 (x2.10), level 4=8.736 (x2.60),
-    level 5=27.0816 (x3.10) ...
-
-    `ratio_increment=0.0` degenerates to the old constant-ratio behavior
-    (`ratio_start ** (n - 1)`). `StrategyConfig.sizing_ratio_start` /
-    `sizing_ratio_increment`."""
+    Example (ratio_start=1.50, table=(0.10, 0.10, 0.20, 0.20, 0.30, 0.30,
+    0.40, 0.40, 0.50, 0.50)): step ratios 1.50, 1.60, 1.70, 1.90, 2.10, 2.40,
+    2.70, 3.10, 3.50, 4.00, 4.50, 5.00, ... (steps 1-2 and 3-4 and so on
+    pair up on the same increment, then 0.50 repeats forever past step 10).
+    `StrategyConfig.sizing_ratio_start` / `sizing_ratio_increment_table`."""
     if n <= 0:
         return 0.0
     multiplier = 1.0
     step_ratio = ratio_start
-    for _ in range(n - 1):
+    for i in range(n - 1):
         multiplier *= step_ratio
-        step_ratio += ratio_increment
+        if ratio_increment_table:
+            increment = ratio_increment_table[i] if i < len(ratio_increment_table) else ratio_increment_table[-1]
+        else:
+            increment = 0.0
+        step_ratio += increment
     return multiplier
 
 
@@ -160,7 +166,7 @@ class StrategyConfig:
     state_export_path: str
     max_fib_level: int
     sizing_ratio_start: float
-    sizing_ratio_increment: float
+    sizing_ratio_increment_table: Tuple[float, ...]
     exchange_id: str
     exchange_options: dict
     exchange_urls: Optional[dict]
@@ -208,7 +214,9 @@ class StrategyConfig:
             state_export_path=raw["paths"]["state_export_path"],
             max_fib_level=int(raw["risk"]["max_fib_level"]),
             sizing_ratio_start=float(raw["risk"].get("sizing_ratio_start", 1.6180339887)),
-            sizing_ratio_increment=float(raw["risk"].get("sizing_ratio_increment", 0.0)),
+            sizing_ratio_increment_table=tuple(
+                float(x) for x in raw["risk"].get("sizing_ratio_increment_table", [])
+            ),
             exchange_id=raw["exchange"]["id"],
             exchange_options=raw["exchange"].get("options", {}),
             exchange_urls=raw["exchange"].get("urls"),
@@ -419,7 +427,7 @@ def compute_rsi(closes: List[float], period: int) -> Optional[float]:
 
 def evaluate_grid_close(price: float, grid: RangeGrid, base_notional_usdt: float,
                          max_fib_level: Optional[int], sizing_ratio_start: float,
-                         sizing_ratio_increment: float,
+                         sizing_ratio_increment_table: Tuple[float, ...],
                          breakeven_price: Optional[float] = None) -> Optional[PlannedOrder]:
     """Grid evaluation, run on EVERY candle close of the configured timeframe
     (rule 2). Returns exactly one order UNLESS price is below Break-Even (see
@@ -442,7 +450,7 @@ def evaluate_grid_close(price: float, grid: RangeGrid, base_notional_usdt: float
         -- or `breakeven_price is None` (no position yet, e.g. the very
         first order of a cycle, though that path bypasses this function
         entirely in `main.py`) -- the usual progression applies:
-        `level_multiplier(|offset| + 1, sizing_ratio_start, sizing_ratio_increment)
+        `level_multiplier(|offset| + 1, sizing_ratio_start, sizing_ratio_increment_table)
         * BASE_NOTIONAL_USDT`, symmetric whether `offset` (the signed
         distance in `grid_step_pct` steps from the fixed anchor) is
         positive, negative, or zero.
@@ -450,13 +458,10 @@ def evaluate_grid_close(price: float, grid: RangeGrid, base_notional_usdt: float
     `max_fib_level=None` disables the safety cap entirely (stress-test mode):
     the level grows without bound as |offset| increases.
 
-    `sizing_ratio_start` / `sizing_ratio_increment` (`StrategyConfig.sizing_
-    ratio_start` / `.sizing_ratio_increment`) drive `level_multiplier`: the
-    ratio used for the step FROM one level TO the next starts at
-    `sizing_ratio_start` and grows by `sizing_ratio_increment` every
-    subsequent step (e.g. start=1.60, increment=0.50 -> step ratios
-    1.60, 2.10, 2.60, 3.10, ...). `sizing_ratio_increment=0` gives a plain
-    constant-ratio geometric progression instead.
+    `sizing_ratio_start` / `sizing_ratio_increment_table` (`StrategyConfig.
+    sizing_ratio_start` / `.sizing_ratio_increment_table`) drive
+    `level_multiplier`: see that function's docstring for the exact
+    step-by-step mechanics and an example.
     """
     offset = grid.classify_offset(price)
 
@@ -468,7 +473,7 @@ def evaluate_grid_close(price: float, grid: RangeGrid, base_notional_usdt: float
         logger.warning("Fib level %d (range offset %d) exceeds max_fib_level=%d; capping at %d.",
                         n, offset, max_fib_level, max_fib_level)
         n = max_fib_level
-    notional = level_multiplier(n, sizing_ratio_start, sizing_ratio_increment) * base_notional_usdt
+    notional = level_multiplier(n, sizing_ratio_start, sizing_ratio_increment_table) * base_notional_usdt
     return PlannedOrder(range_offset=offset, fib_n=n, notional_usdt=notional, kind="fibonacci")
 
 
