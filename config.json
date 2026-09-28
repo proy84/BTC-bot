@@ -1,5 +1,5 @@
 {
-  "_comment": "Only-Short Grid Bot config (v1.1). Secrets and environment-selection live in .env (see .env.example), loaded via python-dotenv -- NOT in this file: BYBIT_API_KEY, BYBIT_API_SECRET, USE_TESTNET, SYMBOL, GRID_STEP_PERCENT. The grid is 100% dynamic: no fixed price list. grid_step_pct defines the geometric spacing between levels (Level_N = base_price * (1 + grid_step_pct/100)^N); base_price (Range 0) is re-anchored to the live market price at startup and after every Take Profit reset, so it is never a config value either.",
+  "_comment": "BTC bot v2 -- hedge a due gambe: BTC/USDT SHORT + BTC/USDC LONG, aperte insieme. Chiavi API, USE_TESTNET e Telegram stanno SOLO in .env (vedi .env.example), mai qui.",
 
   "exchange": {
     "id": "bybit",
@@ -10,55 +10,55 @@
     }
   },
 
-  "_comment_symbol_timeframe": "symbol and grid_step_pct below are fallback defaults, overridden by .env's SYMBOL / GRID_STEP_PERCENT when set. timeframe drives the grid-evaluation clock automatically: '5m' evaluates at XX:05:01/XX:10:01/... (fast testing), '1h' evaluates at HH:00:01 (production).",
-  "symbol": "ETH/USDT:USDT",
-  "timeframe": "1m",
-  "leverage": 150,
-  "margin_mode": "cross",
-  "position_side": "short",
-
-  "grid_step_pct": 0.50,
-  "_comment_grid_step_table_pct": "Overrides grid_step_pct ONLY going UP from Range 0 (Range +1, +2, +3, ...) with a per-step percentage instead of one fixed value: entry i is the distance from Range i to Range i+1 (entry 0 = Range 0->+1, entry 1 = Range +1->+2, etc). Once Range climbs past the table's length, every further step repeats the LAST entry forever. Going DOWN from Range 0 (Range -1, -2, ...) always uses the fixed grid_step_pct above, unaffected by this table. Add/remove/edit entries freely -- any length works. Leave as [] to disable and make the grid fully symmetric again (grid_step_pct on both sides, the pre-v1.3.1 behavior) -- currently disabled, every range (up and down) uses the flat 0.2% grid_step_pct above.",
-  "grid_step_table_pct": [],
-  "base_notional_usdt": 1.0,
-
-  "_comment_trailing_stop": "enabled=false -> FIXED take profit: closes the whole position at market the instant mark_price first drops activation_pct% BELOW the current Break-Even NETTO price (already fee/funding-adjusted) -- single threshold, no arming, no trailing (distance_pct is ignored in this mode). enabled=true -> SHORT-only TRAILING stop: arms at that same activation_pct% threshold, then pins the initial stop distance_pct% ABOVE the arming price and only ever trails down on new lows. Both percentages are real PRICE percentages, not leveraged-margin percentages.",
-  "trailing_stop": {
-    "enabled": false,
-    "activation_pct": 0.10,
-    "distance_pct": 0.7
+  "_comment_legs": "Le due gambe. settle_coin = moneta di regolamento del perpetual; spot_btc_symbol = coppia spot usata per comprare BTC con quella moneta dopo una sequenza vincente.",
+  "legs": {
+    "short": {
+      "symbol": "BTC/USDT:USDT",
+      "side": "short",
+      "settle_coin": "USDT",
+      "spot_btc_symbol": "BTC/USDT"
+    },
+    "long": {
+      "symbol": "BTC/USDC:USDC",
+      "side": "long",
+      "settle_coin": "USDC",
+      "spot_btc_symbol": "BTC/USDC"
+    }
   },
+  "leverage": 125,
+  "margin_mode": "cross",
+
+  "_comment_take_profit": "Una gamba fa TP quando il suo PnL lordo, meno le fee (apertura + chiusura stimata) di ENTRAMBE le gambe, piu' il funding realizzato di ENTRAMBE, e' >= take_profit_net_pct% del notional della gamba stessa. Al TP: CLOSE ALL.",
+  "take_profit_net_pct": 0.20,
 
   "fees": {
     "taker_rate": 0.00055,
     "maker_rate": 0.0002
   },
 
-  "_comment_auto_compound": "Legacy sizing: multiplies base_notional_usdt by (1+percentage/100) on every completed cycle, regardless of account performance. Ignored entirely while equity_based_sizing.enabled=true below (kept here only so you can revert by flipping that flag off).",
-  "auto_compound": {
-    "enabled": true,
-    "percentage": 0.5
-  },
-
-  "_comment_equity_based_sizing": "Replaces auto_compound above when enabled=true: at the start of every cycle (bootstrap and every immediate re-open after a close), re-reads the account's real total equity (Bybit V5 totalEquity, all collateral assets combined) and sets base_notional_usdt to percentage% of it. Self-correcting -- grows only if the account actually grew, shrinks on its own after a drawdown -- instead of compounding blindly by cycle count. base_notional_usdt above is only the seed value used before the first equity read, or if a read ever fails.",
+  "_comment_sizing": "Base notional di ciascuna gamba = percentage% dell'equity totale reale (totalEquity Bybit, tutte le monete), alzata al minimo exchange (0.001 BTC). base_notional_usd e' usato solo se la lettura dell'equity fallisce.",
   "equity_based_sizing": {
     "enabled": true,
     "percentage": 1.0
   },
+  "base_notional_usd": 1.0,
 
-  "_comment_eth_spot_accumulator": "Fully optional, isolated hedge (see eth_spot_accumulator.py) -- at every new cycle's genesis, spends 100% of the free USDT balance on a single SPOT market buy of ETH (never touches the short/perpetual strategy). No minimum threshold: it always attempts the purchase with whatever free USDT is available (if > 0), and simply lets Bybit accept or reject the order -- a rejection (e.g. below the exchange's real minimum) is absorbed by the same fail-safe as any other failure, with zero impact on the main strategy. Set enabled=false to disable without removing the code; delete eth_spot_accumulator.py entirely to remove the feature.",
-  "eth_spot_accumulator": {
-    "enabled": true
+  "_comment_multipliers": "Se dopo il CLOSE ALL la sequenza non e' in guadagno netto (USDT + USDC <= 0): riapre con moltiplicatori CUMULATIVI per gamba -- gamba che ha fatto TP = importo precedente x winner, l'altra = importo precedente x loser. max_multiplier_steps: null = nessun limite; un intero N = dopo N riaperture moltiplicate il bot chiude tutto e si ferma.",
+  "multipliers": {
+    "winner": 2.0,
+    "loser": 1.5
+  },
+  "max_multiplier_steps": null,
+
+  "_comment_settlement": "Sequenza in guadagno netto: la moneta vincente copre la perdita dell'altra con una conversione SPOT su stable_conversion_symbol (su Bybit Demo /v5/account/repay non e' supportato), poi col resto compra BTC spot. Ordini spot sotto spot_min_order_value (minimo Bybit 5) vengono alzati al minimo (repay) o saltati (acquisto BTC). enabled=false: nessuna operazione spot, solo reset a base.",
+  "settlement": {
+    "enabled": true,
+    "stable_conversion_symbol": "USDC/USDT",
+    "spot_min_order_value": 5.0
   },
 
-  "_comment_notifier": "Fully optional, isolated Telegram notification (see notifier.py) -- fires once per closed cycle (take profit or trailing stop) with cycle_id, net PnL, total equity (USDT+EUR), and the collateral breakdown per coin. Requires TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID in .env (never here); if missing, silently does nothing. Set enabled=false to disable without removing the code; delete notifier.py entirely to remove the feature.",
   "notifier": {
     "enabled": true
-  },
-
-  "_comment_grid_reindex": "enabled=true (default): Range 0 follows the Break-Even, re-pointed after every fill -- Fibonacci offsets are always measured relative to wherever Break-Even currently sits, so the multiplier effectively 'resets' each time Break-Even catches up to a new band. enabled=false: the grid stays TRULY static for the whole cycle -- zero_index never moves from 0, so every offset (and Fibonacci level) is always measured from the cycle's ORIGINAL anchor price. Price quotes/levels themselves are identical either way; this only changes which level is LABELED Range 0, and therefore how fast Fibonacci sizing grows over a long, heavily-mediated cycle.",
-  "grid_reindex": {
-    "enabled": false
   },
 
   "polling": {
@@ -67,28 +67,8 @@
   },
 
   "paths": {
-    "trade_history_path": "trade_history.json",
-    "state_export_path": "bot_state.json"
-  },
-
-  "_comment_risk": "sizing_ratio_start / sizing_ratio_increment_table drive the sizing multiplier between mediation levels: level 1 is always the base unit; the ratio used for the step from one level to the next starts at sizing_ratio_start, then after each step is bumped by that step's own entry in sizing_ratio_increment_table (entry i = the increment applied after step i). Once past the table's length, every further step reuses the table's LAST entry forever -- same convention as grid_step_table_pct. Current table [0.20,0.30,0.40,0.50,0.60,0.70,0.80,0.90,1.00]: entry i is labeled 'level i+2' (the increment that kicks in once that level is reached, affecting the NEXT step) -- reaching level 2 adds +0.20 (making step 2->3 use 1.70), level 3 adds +0.30 (step 3->4 = 2.00), ... level 10 adds +1.00 (step 10->11 = 6.90), which then repeats forever past level 10. With start=1.50: step ratios 1.50, 1.70, 2.00, 2.40, 2.90, 3.50, 4.20, 5.00, 5.90, 6.90, 7.90, ... Leave the table as [] for a plain constant-ratio geometric progression (ratio_start ** (n-1)) instead. Replaces the old true-Fibonacci-sequence sizing (whose own ratio isn't constant, it only approaches ~1.618 for large levels).",
-  "risk": {
-    "max_fib_level": 200,
-    "sizing_ratio_start": 10.0,
-    "sizing_ratio_increment_table": []
-  },
-
-  "_comment_stress_test": "High-frequency time-acceleration stress test mode. When enabled=true it REPLACES the normal timeframe/candle-close scheduler: all ranges evaluate at base_interval_sec (flat, no per-range table) UNLESS RSI tick mode is active, in which case grid orders fire every tick_mode_interval_sec instead. base_interval_sec=2 combined with the 'one order per range per cycle' rule turns this into effectively REACTIVE evaluation: as soon as price enters a range that hasn't fired yet this cycle, the corresponding Fibonacci order fires within ~2s, instead of waiting for a slow timer -- revisiting an already-used range is a cheap no-op (logged at DEBUG level, not INFO, to avoid flooding the log at this cadence). rsi_enabled=false disables the RSI reading/tick-mode entirely (base cadence only, forever) while leaving everything else in stress-test mode (base cadence, Neutral Zone, unlimited_fib_level) untouched -- flip it back to true to re-arm RSI/tick-mode later without touching anything else. When rsi_enabled=true, tick mode is triggered by an RSI(rsi_period) reading on rsi_timeframe crossing UP through rsi_overbought_threshold (a fresh crossing from below -- staying overbought does not re-trigger it), and stays on until the position's Break-Even price catches up to the market's current grid band, at which point the base cadence resumes. unlimited_fib_level=true removes the risk.max_fib_level safety cap for this mode only. Set enabled=false to fall back to the normal production scheduler/cap untouched.",
-  "stress_test": {
-    "enabled": true,
-    "base_interval_sec": 2,
-    "rsi_enabled": false,
-    "tick_mode_interval_sec": 1,
-    "rsi_timeframe": "1d",
-    "rsi_period": 14,
-    "rsi_overbought_threshold": 70,
-    "neutral_zone_enabled": true,
-    "neutral_zone_percent": 0.15,
-    "unlimited_fib_level": true
+    "trade_history_path": "btc_bot_history.json",
+    "state_export_path": "btc_bot_live.json",
+    "runtime_state_path": "btc_bot_state.json"
   }
 }
