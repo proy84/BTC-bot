@@ -1,1158 +1,487 @@
 """
 main.py
 
-Orchestrator for the Only-Short grid bot. Wires together `exchange.py`
-(I/O), `strategy.py` (pure grid/Fibonacci decision logic), `fees.py` (PnL &
-break-even math), `analytics.py` (cycle history) and `data_exporter.py`
-(dashboard state).
+BTC bot -- two-leg hedge orchestrator (Bybit V5, Demo Trading by default).
 
-GRID IS STATIC FOR THE WHOLE CYCLE: `self.grid` (a `RangeGrid`) is anchored
-ONCE, via `RangeGrid.full_reset()`, at the cycle's very first fill -- at bot
-startup / position bootstrap (`_bootstrap_position`), and again exactly once
-after each trailing-stop close (`_reset_state_after_close`). Between those
-two moments `grid.base_price` NEVER changes: no downside re-anchoring, no
-RSI-catch-up re-anchoring, nothing. Every subsequent order, at any offset
-(positive above the anchor, negative below), is priced purely by
-classifying the current price against that one fixed anchor (see
-`strategy.evaluate_grid_close`). Break-Even (`PositionManager.avg_entry_price`
-/ `fees.compute_breakeven_prices`) is tracked completely separately and
-updates with every fill regardless of the grid -- it feeds only the
-trailing-stop calculation below, never the grid's levels.
+Loop (every `polling.tick_poll_interval_sec`), always under `_position_lock`:
+  1. If a CLOSE ALL is in progress, keep closing whatever is still open; once
+     both legs are flat, settle the cycle (see 4).
+  2. Otherwise make sure both legs are open at the sequence's target notional
+     (BTC/USDT SHORT + BTC/USDC LONG, market orders). A leg that failed to
+     open is retried after OPEN_RETRY_DELAY_SEC.
+  3. With both legs open: poll realized funding, evaluate the two-leg net TP
+     (`strategy.check_take_profit`). A hit starts CLOSE ALL.
+  4. Settlement: realized net per coin -> sequence totals -> decision
+     (`strategy.decide_after_close`):
+       - NEW_SEQUENCE: repay the losing coin via a spot conversion from the
+         winning coin, buy BTC spot with the rest, restart at base notional;
+       - MULTIPLY: cumulative per-leg multipliers (TP leg x2, other x1.5);
+       - STOP (only if max_multiplier_steps is set): stay flat and halt.
+     Then the next cycle opens immediately.
 
-Two independent loops:
-  - Grid scheduler: in normal (production) mode, wakes up once per
-    `config.timeframe` interval, 1 second after the boundary (e.g. "5m" ->
-    XX:05:01, XX:10:01 UTC; "1h" -> HH:00:01 UTC), fetches the just-CLOSED
-    candle and ALWAYS executes one grid order sized off the current price's
-    (signed) distance from the fixed anchor -- there is no "idle" outcome,
-    even if price stayed exactly where it was last candle. In
-    `stress_test.enabled` mode (see below) this scheduler is replaced
-    entirely by a variable-interval, tick-driven one.
-  - Tick loop (every `tick_poll_interval_sec`, default 2s): recomputes real
-    net PnL, drives the SHORT-only trailing stop, exports live state for
-    the frontend, and (stress-test mode only) checks whether the position's
-    average entry price has caught up to the market's current grid band
-    (to decide the RSI tick-mode cadence -- never to move the grid).
+State that must survive a restart (sequence id, step, per-leg target
+notionals, per-coin sequence net) lives in `paths.runtime_state_path`.
 
-STRESS TEST MODE (`config.stress_test.enabled`): a deliberate, reversible
-override of the production scheduling model for high-frequency demo
-testing. Three changes apply only while enabled:
-  1. All ranges evaluate at a flat `stress_test.base_interval_sec` cadence
-     (no per-range table) -- UNLESS RSI tick mode is active (see below), in
-     which case evaluation fires every `stress_test.tick_mode_interval_sec`
-     instead. Evaluation itself reads the live mark price, not a closed
-     candle, since sub-minute cadences have no matching OHLCV timeframe.
-  2. `stress_test.unlimited_fib_level` removes the `risk.max_fib_level`
-     safety cap for grid sizing -- the only limit left is the exchange
-     itself rejecting an order for insufficient margin, which the existing
-     error handling in `_execute_planned_order` already absorbs gracefully.
-  3. RSI trigger (`_maybe_update_rsi` / `_maybe_handle_rsi_tick_mode`): an
-     RSI(`rsi_period`) reading on `rsi_timeframe` crossing UP through
-     `rsi_overbought_threshold` (a fresh crossing from below -- staying
-     overbought does not re-trigger it) switches on tick-mode execution at
-     whatever offset price currently sits at, relative to the fixed anchor.
-     Grid orders at that cadence pull the position's average entry price
-     (break-even) with every fill; once break-even catches up to the live
-     market's grid band, tick mode turns off and the base cadence resumes
-     -- the grid's anchor itself is NEVER touched, only the cadence. A
-     fresh RSI crossing is required to re-arm it.
-Disabling `stress_test.enabled` restores the exact production behavior
-(fixed timeframe, candle-close evaluation, capped Fibonacci level, no RSI
-trigger) with no other code path affected.
-
-Exit is config-driven via `trailing_stop.enabled`:
-  - `false` (current default): FIXED take profit (`_maybe_handle_fixed_take_profit`)
-    -- closes the whole position at market the instant `mark_price` first drops
-    `trailing_stop.activation_pct`% below the current Break-Even NETTO price
-    (see `fees.compute_breakeven_prices` -- already fee/funding-adjusted). A
-    single threshold check, no arming, no trailing; `distance_pct` is unused.
-  - `true`: SHORT-only TRAILING stop (`_maybe_handle_trailing_stop`) -- NOT
-    active at position entry. It arms the instant `mark_price` first drops to
-    that same `activation_pct`% threshold, pinning the initial stop
-    `trailing_stop.distance_pct`% ABOVE that arming price. From then on, every
-    tick that makes a NEW LOW pulls the stop down with it (still
-    `distance_pct`% above the lowest mark_price seen since arming) -- the stop
-    never retraces upward on a bounce. The position closes at market the
-    instant `mark_price` rises back up to touch or cross the stop.
-Both percentages are real PRICE percentages, not leveraged-margin percentages.
-
-Grid-triggered entries and trailing-stop-triggered closes both mutate the
-same position state, and each involves at least one `await` (an exchange
-call) -- without protection, a grid evaluation firing in the same instant as
-a trailing-stop close could interleave and corrupt the PnL bookkeeping (the
-close would execute against the exchange's real, up-to-date position while
-our recorded gross/fees were snapshotted from a stale, smaller position).
-`self._position_lock` (asyncio.Lock) serializes every position mutation --
-`_execute_planned_order` and the close+record portion of `_close_cycle` --
-so the two flows can never interleave.
-
-Two situations bypass the candle-close wait and fire a market order
-immediately, per spec -- and both are the ONLY two moments the grid's
-anchor is ever set:
-  1. Bot startup with no open position on the symbol -> immediate base
-     SHORT (Fibonacci(1) * BASE_NOTIONAL_USDT) at market, anchoring the
-     grid to the current price for the whole cycle.
-  2. A cycle closing via the trailing stop -> immediate re-open of the new
-     base SHORT at market, anchoring a fresh grid for the new cycle.
-Every subsequent order (at any offset, positive or negative, relative to
-that one fixed anchor) is decided strictly on candle close.
-
-In `stress_test.enabled` mode, case 2 also restarts the base-cadence
-countdown (`_cadence_reset_event`): the cycle's SECOND order always lands
-exactly `stress_test_base_interval_sec` after that immediate re-open, rather
-than the base cadence continuing to tick on its own schedule regardless of
-when cycles happen to close and reopen.
+Clean remote shutdown: create a file named STOP next to main.py.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
-import math
 import os
 import time
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import List
+from typing import Dict, Optional
 
-from analytics import AnalyticsEngine, CycleRecord, OrderRecord
-from data_exporter import DataExporter, LiveState
-from exchange import ExchangeClient
-from fees import EntryFill, FeeEngine, FeeSchedule, FundingPayment, compute_breakeven_prices, compute_net_pnl
+from analytics import AnalyticsEngine, CycleRecord, LegResult
+from data_exporter import DataExporter
+from exchange import ExchangeClient, FilledOrder
+from fees import LegPosition, gross_pnl, realized_leg_net
 from strategy import (
-    PlannedOrder,
-    PositionManager,
-    RangeGrid,
-    StrategyConfig,
-    compute_rsi,
-    evaluate_grid_close,
-    fibonacci,
-    level_multiplier,
+    BOT_NAME, MULTIPLY, NEW_SEQUENCE, STOP, Decision, SequenceState, StrategyConfig,
+    check_take_profit, decide_after_close, effective_base_notional, evaluate_legs,
+    plan_spot_settlement, qty_for_notional,
 )
 
-logger = logging.getLogger("eth_grid_bot.main")
+logger = logging.getLogger("btc_bot.main")
 
-BOT_VERSION = "1.4"
+BOT_VERSION = "2.0"
 CONFIG_PATH = "config.json"
-CANDLE_CLOSE_OFFSET_SEC = 1.0  # evaluate the grid 1s after each timeframe boundary
-RSI_POLL_INTERVAL_SEC = 15.0  # how often the tick loop re-checks for a newly-closed RSI candle
-STOP_SIGNAL_PATH = Path("STOP")  # touch this file (same dir as main.py) for a clean remote shutdown
-# Extra safety net against the rare/still-not-fully-diagnosed duplicate-
-# opening-order bug (a stale grid evaluation from the previous cycle
-# occasionally still slips through the cycle_id check under just the right
-# timing): for this many seconds after a new cycle's automatic opening order
-# starts firing, the grid scheduler refuses to fire ANY other order, no
-# matter which range it targets. All duplicates observed so far landed
-# within ~1s of the opening order, so this window is deliberately generous.
-# A band-aid, not a real fix -- it suppresses the symptom regardless of root
-# cause, at the cost of occasionally skipping a genuine, fast-moving early
-# mediation order too.
-ONE_ORDER_WINDOW_SEC = 2.0
+STOP_SIGNAL_PATH = Path("STOP")
+OPEN_RETRY_DELAY_SEC = 30.0
+HEARTBEAT_INTERVAL_SEC = 300.0
 
 
-def parse_timeframe_seconds(timeframe: str) -> int:
-    """Converts a CCXT-style timeframe string ('5m', '1h', '1d', ...) to seconds."""
-    units = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
-    if len(timeframe) < 2 or timeframe[-1] not in units:
-        raise ValueError(f"Unsupported timeframe format: {timeframe!r}")
-    try:
-        value = int(timeframe[:-1])
-    except ValueError as exc:
-        raise ValueError(f"Unsupported timeframe format: {timeframe!r}") from exc
-    if value <= 0:
-        raise ValueError(f"Timeframe must be positive: {timeframe!r}")
-    return value * units[timeframe[-1]]
-
-
-class GridBotOrchestrator:
+class BtcBot:
     def __init__(self, cfg: StrategyConfig):
         self.cfg = cfg
-        self.timeframe_sec = parse_timeframe_seconds(cfg.timeframe)
-
+        self.fees = cfg.fee_schedule
         self.exchange = ExchangeClient(cfg)
-        # base_price=0.0 here is a throwaway placeholder: _bootstrap_position() always
-        # overwrites it from the live market price (or an existing position's entry
-        # price) before the grid is ever evaluated. There is no config-driven default --
-        # the grid has no fixed price list, only a step percentage.
-        self.grid = RangeGrid(base_price=0.0, step_pct=cfg.grid_step_pct,
-                              step_table_pct=cfg.grid_step_table_pct)
-        self.position = PositionManager()
-        self.fee_engine = FeeEngine(schedule=FeeSchedule(taker_rate=cfg.taker_rate, maker_rate=cfg.maker_rate))
         self.analytics = AnalyticsEngine(cfg.trade_history_path)
         self.exporter = DataExporter(cfg.state_export_path, self.analytics)
+        self.runtime_state_path = Path(cfg.runtime_state_path)
 
-        self.base_notional_usdt = cfg.base_notional_usdt
-        self.cycle_id = self.analytics.summary().completed_cycles + 1
+        self.seq: Optional[SequenceState] = None
+        self.legs: Dict[str, LegPosition] = {}
         self.cycle_start_ts_ms = int(time.time() * 1000)
-        self.cycle_orders: List[OrderRecord] = []
 
-        self._last_funding_poll_ts = 0.0
-        # Dedup set for realized funding settlement ids (see _maybe_poll_funding)
-        # -- a polling window can re-observe the same real settlement more than
-        # once before it ages out of the queried range.
-        self._recorded_funding_ids: set = set()
-        # Range offsets that have already received an order THIS cycle --
-        # once a range has fired, it never fires again for the rest of the
-        # cycle, even if price leaves and later revisits that same range.
-        # Reset every new cycle (see _reset_state_after_close).
-        self._used_range_offsets: set = set()
-        # Advances forward as settlements are processed, so a cycle that stays
-        # open for a very long time (weeks+) never needs more than a handful
-        # of NEW settlements per poll -- re-querying the whole cycle's history
-        # from cycle_start_ts_ms every time would eventually exceed
-        # fetch_realized_funding's page size (Bybit settles 3x/day -- a cycle
-        # open >~16 days would exceed limit=50) and silently miss some real
-        # settlements. None means "start from cycle_start_ts_ms".
-        self._funding_since_ms: int | None = None
-        # Holds strong references to fire-and-forget background tasks (e.g.
-        # the optional spot-ETH accumulator hook) so asyncio can't garbage-
-        # collect one mid-execution; each task removes itself on completion.
-        self._background_tasks: set = set()
+        # CLOSE ALL in progress: the leg that hit TP, and the close fills
+        # collected so far (a leg whose close failed is retried next tick).
+        self._closing_tp_leg: Optional[str] = None
+        self._close_fills: Dict[str, Optional[FilledOrder]] = {}
+        self._close_marks: Dict[str, float] = {}
+
+        # Realized funding, per leg: dedup by settlement id + moving window.
+        self._funding_ids: Dict[str, set] = {}
+        self._funding_since_ms: Dict[str, int] = {}
+        self._last_funding_poll = 0.0
+
+        self._open_retry_after = 0.0
+        self._last_heartbeat = 0.0
+        self._halted = False
         self._stop_event = asyncio.Event()
         self._position_lock = asyncio.Lock()
-        # Set by `_close_cycle` right after the new cycle's immediate base
-        # order fires; consumed by `_wait_interruptible` to abort the base
-        # cadence's countdown early and restart it fresh from that moment --
-        # so "second order of the cycle" always lands exactly
-        # `stress_test_base_interval_sec` after the cycle's immediate first
-        # order, instead of the base cadence ticking on its own independent
-        # schedule regardless of cycle boundaries.
-        self._cadence_reset_event = asyncio.Event()
-        # Set (monotonic clock) at the instant every new cycle's automatic
-        # opening order starts firing -- see ONE_ORDER_WINDOW_SEC below and
-        # its use in `_run_grid_evaluation`.
-        self._cycle_opened_at = time.monotonic()
-        # Updated by the tick loop every `tick_poll_interval_sec`; used by the
-        # stress-test scheduler to pick the next evaluation delay without an
-        # extra dedicated price fetch. Only ever a few seconds stale, which is
-        # immaterial against the coarsest cadence (600s).
-        self._last_mark_price: float | None = None
-        # RSI trigger state (stress-test only). `_current_rsi` is the last
-        # computed reading; `_rsi_last_candle_ts` gates recomputation to once
-        # per newly-closed rsi_timeframe candle. `_rsi_tick_mode_active`
-        # becomes True only on an UPWARD CROSSING of the overbought threshold
-        # (previous reading < threshold <= new reading) -- staying overbought
-        # across candles does not re-trigger it, only a fresh crossing does.
-        # It turns back off (and requires a fresh crossing to re-arm) once the
-        # position's break-even price has caught up to the market's current
-        # grid band, or whenever a new cycle starts (trailing-stop close).
-        # The grid's own anchor is never touched by this flag either way.
-        self._current_rsi: float | None = None
-        self._rsi_last_candle_ts: int | None = None
-        self._last_rsi_poll_ts = 0.0
-        self._rsi_tick_mode_active = False
-        # SHORT-only trailing stop. `_trailing_active` becomes True the
-        # instant mark_price first drops to trailing_activation_pct% below
-        # Break-Even NETTO (never at entry); `_trailing_lowest_price` then
-        # tracks the lowest mark_price seen since arming, and the stop is
-        # always trailing_distance_pct% above it -- monotonically
-        # non-increasing, never retraces upward on a bounce. Both reset on
-        # every cycle close (see `_reset_state_after_close`).
-        self._trailing_active = False
-        self._trailing_lowest_price: float | None = None
+        self._background_tasks: set = set()
 
     # -- lifecycle -----------------------------------------------------------
 
     async def start(self) -> None:
-        logger.info("[INFO] Avvio Bot Trading - v%s", BOT_VERSION)
+        short, long_ = self.cfg.legs["short"], self.cfg.legs["long"]
+        logger.info("[INFO] Avvio %s v%s -- SHORT %s + LONG %s, leva %dx, TP netto %.2f%%, "
+                    "moltiplicatori x%.2f/x%.2f, max_multiplier_steps=%s, %s",
+                    BOT_NAME, BOT_VERSION, short.symbol, long_.symbol, self.cfg.leverage,
+                    self.cfg.take_profit_net_pct, self.cfg.winner_multiplier, self.cfg.loser_multiplier,
+                    self.cfg.max_multiplier_steps, "DEMO" if self.cfg.use_testnet else "PRODUZIONE")
         await self.exchange.setup()
-        await self._bootstrap_position()
-        logger.info("Bot running: cycle_id=%d range_base_price=%.4f grid_step_pct=%.3f%% base_notional=%.2f "
-                    "timeframe=%s (%ds)",
-                    self.cycle_id, self.grid.base_price, self.cfg.grid_step_pct * 100.0, self.base_notional_usdt,
-                    self.cfg.timeframe, self.timeframe_sec)
-        if self.cfg.stress_test_enabled:
-            logger.warning(
-                "[stress-test] STRESS TEST MODE ENABLED: STATIC grid (anchored once per cycle, never re-anchors); "
-                "base cadence %.0fs for all ranges; RSI(%d) on %s >= %.1f triggers tick mode (every %.0fs) until "
-                "Break-Even catches up to the market's grid band; Neutral Zone %s (%.2f%% around Break-Even "
-                "LORDO); Fibonacci cap %s. Set stress_test.enabled=false in config.json to return to "
-                "production behavior.",
-                self.cfg.stress_test_base_interval_sec, self.cfg.stress_test_rsi_period,
-                self.cfg.stress_test_rsi_timeframe, self.cfg.stress_test_rsi_overbought_threshold,
-                self.cfg.stress_test_tick_mode_interval_sec,
-                "ENABLED" if self.cfg.stress_test_neutral_zone_enabled else "DISABLED",
-                self.cfg.stress_test_neutral_zone_percent,
-                "DISABLED" if self.cfg.stress_test_unlimited_fib_level else self.cfg.max_fib_level,
-            )
-        await asyncio.gather(self._grid_scheduler_loop(), self._tick_loop())
+        await self._bootstrap()
+        self._notify_text("Avvio", [
+            f"Sequenza #{self.seq.sequence_id}, passo {self.seq.step}",
+            f"Target: SHORT {self.seq.notionals['short']:.2f} / LONG {self.seq.notionals['long']:.2f}",
+        ])
+        await self._tick_loop()
 
     async def stop(self) -> None:
         self._stop_event.set()
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
         await self.exchange.close()
 
-    # -- startup bootstrap (rule 3: immediate first entry) -------------------
+    # -- bootstrap / persistence --------------------------------------------
 
-    async def _bootstrap_position(self) -> None:
-        """No candle wait for the very first Range 0 entry: if the exchange
-        reports no open position on the symbol, open the base SHORT right
-        now at market and anchor Range 0 to the current price."""
+    async def _bootstrap(self) -> None:
+        self.seq = self._load_runtime_state()
         positions = await self.exchange.fetch_open_positions()
-        existing = next((p for p in positions if p.qty > 0), None)
 
-        if existing is not None:
-            logger.warning(
-                "Existing open position detected on %s at startup (qty=%.6f, avg_entry=%.2f). "
-                "Reconciling it as a single synthetic entry -- per-level Fibonacci history cannot "
-                "be recovered from the exchange after a restart.",
-                self.cfg.symbol, existing.qty, existing.entry_price,
+        if self.seq is None:
+            base = await self._compute_base_notional()
+            last_seq = max((c.sequence_id for c in self.analytics.cycles), default=0)
+            self.seq = SequenceState.new(base, sequence_id=last_seq + 1,
+                                         cycle_id=len(self.analytics.cycles) + 1)
+            logger.info("Nessuno stato salvato: nuova sequenza #%d, base %.2f per gamba.",
+                        self.seq.sequence_id, base)
+
+        for name, leg_cfg in self.cfg.legs.items():
+            pos = positions.get(leg_cfg.symbol)
+            if pos is None:
+                continue
+            if pos.side != leg_cfg.side:
+                self._halted = True
+                raise RuntimeError(
+                    f"Posizione esistente su {leg_cfg.symbol} e' {pos.side.upper()}, attesa "
+                    f"{leg_cfg.side.upper()}: chiudila a mano prima di avviare {BOT_NAME}."
+                )
+            self.legs[name] = LegPosition(
+                name=name, symbol=leg_cfg.symbol, side=leg_cfg.side, settle_coin=leg_cfg.settle_coin,
+                qty=pos.qty, entry_price=pos.entry_price,
+                # the real opening fee is not recoverable after a restart: estimate it
+                open_fee=self.fees.taker_fee_for_notional(pos.entry_price * pos.qty),
             )
-            self.position.add_entry(EntryFill(
-                price=existing.entry_price, qty=existing.qty,
-                notional_usdt=existing.entry_price * existing.qty,
-                taker_fee_usdt=0.0, fib_level=0, timestamp_ms=int(time.time() * 1000),
-            ))
-            self.grid.full_reset(existing.entry_price)
-            await self._maybe_update_base_notional_from_equity()
-            logger.info("Range 0 anchored to reconciled entry price %.4f", existing.entry_price)
-            return
+            logger.warning("Posizione esistente riconciliata: %s %s qty=%.6f entry=%.2f (fee apertura stimata).",
+                           leg_cfg.side.upper(), leg_cfg.symbol, pos.qty, pos.entry_price)
+        self._save_runtime_state()
 
-        mark_price = await self.exchange.fetch_mark_price()
-        self.grid.full_reset(mark_price)
-        logger.info("No open position found on %s. Opening the base SHORT immediately at market "
-                    "(Range 0, Fibonacci 1), base_price=%.4f.",
-                    self.cfg.symbol, mark_price)
-        await self._execute_immediate_base_order(kind="range_zero_immediate")
-
-    async def _execute_immediate_base_order(self, kind: str) -> None:
-        """Fires the Range 0 base SHORT (Fibonacci(1) * BASE_NOTIONAL_USDT) at market,
-        bypassing the candle-close wait. Used at startup and right after a Take Profit reset."""
-        # Starts the ONE_ORDER_WINDOW_SEC clock (see `_run_grid_evaluation`)
-        # as early as possible, right as this cycle's one guaranteed order
-        # begins -- not after it finishes, since that already covers any
-        # slowness in placing it.
-        self._cycle_opened_at = time.monotonic()
+    def _load_runtime_state(self) -> Optional[SequenceState]:
+        if not self.runtime_state_path.exists():
+            return None
         try:
-            mark_price = await self.exchange.fetch_mark_price()
+            seq = SequenceState.from_dict(json.loads(self.runtime_state_path.read_text(encoding="utf-8")))
+            logger.info("Stato ripreso: sequenza #%d passo %d, target SHORT %.2f / LONG %.2f, netto %s.",
+                        seq.sequence_id, seq.step, seq.notionals["short"], seq.notionals["long"],
+                        seq.net_by_coin)
+            return seq
         except Exception:
-            logger.exception("Failed to fetch mark price for the immediate base order; "
-                              "the position stays flat until the next tick can retry implicitly.")
-            return
+            logger.exception("Stato %s illeggibile: riparto da una nuova sequenza.", self.runtime_state_path)
+            return None
 
-        await self._maybe_update_base_notional_from_equity()
-        base_notional = self._effective_base_notional(mark_price)
-        order = PlannedOrder(
-            range_offset=0, fib_n=1,
-            notional_usdt=level_multiplier(1, self.cfg.sizing_ratio_start, self.cfg.sizing_ratio_increment_table)
-            * base_notional,
-            kind=kind,
-        )
-        await self._execute_planned_order(order, mark_price, int(time.time() * 1000), self.cycle_id)
-
-        # Optional, fully isolated feature (see eth_spot_accumulator.py):
-        # deliberately NOT `await`ed -- runs as a background task so a slow
-        # or hanging spot-market call can never delay this cycle's short
-        # entry, which has already fired above regardless of what happens
-        # here. The import is local and deferred (not at module level) and
-        # wrapped in its own try/except so that deleting eth_spot_accumulator.py
-        # degrades to a silent no-op here instead of crashing the bot --
-        # deleting that file is the entire removal procedure for this feature.
+    def _save_runtime_state(self) -> None:
+        tmp = self.runtime_state_path.with_suffix(".tmp")
         try:
-            import eth_spot_accumulator
-            task = asyncio.create_task(eth_spot_accumulator.maybe_buy_eth_spot(
-                self.exchange, self.cfg.eth_spot_accumulator_enabled,
-            ))
-            self._background_tasks.add(task)
-            task.add_done_callback(self._background_tasks.discard)
-        except Exception:
-            pass
+            tmp.write_text(json.dumps(self.seq.to_dict(), indent=2), encoding="utf-8")
+            tmp.replace(self.runtime_state_path)
+        except OSError:
+            logger.exception("Salvataggio stato %s fallito", self.runtime_state_path)
 
-    async def _maybe_update_base_notional_from_equity(self) -> None:
-        """Equity-based sizing (config `equity_based_sizing.enabled`): at every
-        cycle's genesis (bootstrap, and immediate re-open after a close),
-        re-reads the account's REAL total equity and sets `base_notional_usdt`
-        to `equity_based_sizing_percentage`% of it -- replacing the old
-        cycle-count-based auto-compound (see `_reset_state_after_close`, which
-        skips its own multiplication when this is enabled) with sizing that
-        tracks actual capital: it grows only if the account really grew, and
-        shrinks on its own after a drawdown, instead of ratcheting up forever
-        regardless of performance. Recomputed fresh every cycle (never
-        cached/persisted) so it always reflects current capital. On any
-        failure (network, unexpected response shape, non-positive equity),
-        `base_notional_usdt` is left unchanged -- the cycle still opens with
-        whatever value it last held, rather than blocking or crashing."""
-        if not self.cfg.equity_based_sizing_enabled:
-            return
-        try:
-            equity = await self.exchange.fetch_total_equity()
-        except Exception:
-            logger.exception(
-                "Failed to fetch account equity for equity-based sizing; keeping base_notional_usdt=%.2f unchanged.",
-                self.base_notional_usdt,
-            )
-            return
-        if equity <= 0:
-            logger.warning("Fetched equity <= 0 (%.2f); keeping base_notional_usdt=%.2f unchanged.",
-                            equity, self.base_notional_usdt)
-            return
-        old = self.base_notional_usdt
-        self.base_notional_usdt = equity * self.cfg.equity_based_sizing_percentage / 100.0
-        logger.debug(
-            "Equity-based sizing: equity totale=%.2f USDT -> base_notional_usdt %.2f -> %.2f (%.2f%% dell'equity).",
-            equity, old, self.base_notional_usdt, self.cfg.equity_based_sizing_percentage,
-        )
-
-    def _effective_base_notional(self, price: float) -> float:
-        """The Fibonacci sequence's base unit (fib_n=1) for THIS evaluation:
-        whichever is larger between the configured `base_notional_usdt` and
-        the exchange's minimum tradable notional at the current price
-        (`min_order_qty() * price`). Without this, a `base_notional_usdt`
-        below the exchange minimum would make every early fib_n level
-        (however many it takes for `Fibonacci(n) * base_notional_usdt` to
-        naturally exceed the minimum) collapse to the SAME floored qty
-        independently, producing a run of identical orders instead of a
-        real progression. Recomputed fresh on every call (not cached/stored)
-        so it stays correct at any price, indefinitely -- same philosophy as
-        `ExchangeClient.min_order_qty()` itself."""
-        min_qty = self.exchange.min_order_qty()
-        min_notional = min_qty * price if min_qty > 0 else 0.0
-        return max(self.base_notional_usdt, min_notional)
-
-    # -- grid scheduling (rule 2/3: increments & shifts wait for candle close, --
-    # -- unless stress_test.enabled overrides with a variable tick-driven cadence) -
-
-    def _seconds_until_next_boundary(self) -> float:
-        now = time.time()
-        next_boundary = (math.floor(now / self.timeframe_sec) + 1) * self.timeframe_sec
-        target = next_boundary + CANDLE_CLOSE_OFFSET_SEC
-        return max(0.0, target - now)
-
-    async def _wait_interruptible(self, timeout_sec: float) -> bool:
-        """Like `_wait_or_stop`, but for the stress-test BASE cadence only:
-        polls in 1s steps so it can break out early on either of two events --
-        RSI tick mode activating mid-wait (see `_maybe_update_rsi`), or a new
-        cycle starting mid-wait (`_cadence_reset_event`, set by `_close_cycle`
-        right after the new cycle's immediate order fires) -- instead of
-        finishing out a stale wait. Returns True only if shutdown was
-        requested; either other interruption returns False just like a
-        normal timeout, so the caller re-decides cadence from scratch
-        either way."""
-        elapsed = 0.0
-        step = 1.0
-        while elapsed < timeout_sec:
-            this_step = min(step, timeout_sec - elapsed)
-            if await self._wait_or_stop(this_step):
-                return True
-            elapsed += this_step
-            if self._rsi_tick_mode_active:
-                return False
-            if self._cadence_reset_event.is_set():
-                return False
-        return False
-
-    async def _grid_scheduler_loop(self) -> None:
-        """Every iteration's body runs under its own try/except: unlike a
-        transient network error inside `_run_grid_evaluation` (already
-        handled there), an unexpected exception ANYWHERE in this loop
-        (scheduling math, Neutral Zone, order execution/bookkeeping) would
-        otherwise propagate out of this coroutine, which `asyncio.gather` in
-        `start()` would treat as fatal -- cancelling the tick loop right
-        along with it and killing the whole process silently. Mirrors the
-        try/except already wrapping `_tick_loop`'s body."""
-        while not self._stop_event.is_set():
+    async def _compute_base_notional(self) -> float:
+        prices = await self.exchange.fetch_last_prices(l.symbol for l in self.cfg.legs.values())
+        mins = {name: self.exchange.min_order_qty(l.symbol) * prices[l.symbol]
+                for name, l in self.cfg.legs.items()}
+        equity = 0.0
+        if self.cfg.equity_based_sizing_enabled:
             try:
-                if self.cfg.stress_test_enabled:
-                    if self._rsi_tick_mode_active:
-                        sleep_sec = self.cfg.stress_test_tick_mode_interval_sec
-                        logger.info("[stress-test] Next grid evaluation in %.1fs (RSI tick mode).", sleep_sec)
-                        if await self._wait_or_stop(sleep_sec):
-                            break
-                    else:
-                        sleep_sec = self.cfg.stress_test_base_interval_sec
-                        logger.debug("[stress-test] Next grid evaluation in %.1fs (base cadence).", sleep_sec)
-                        if await self._wait_interruptible(sleep_sec):
-                            break
-                        if self._cadence_reset_event.is_set():
-                            self._cadence_reset_event.clear()
-                            logger.debug(
-                                "[stress-test] Cadenza oraria riavviata: nuovo ciclo aperto durante l'attesa -- "
-                                "prossimo ordine schedulato tra %.0fs esatti da adesso.",
-                                self.cfg.stress_test_base_interval_sec,
-                            )
-                            continue
-                else:
-                    sleep_sec = self._seconds_until_next_boundary()
-                    next_run = datetime.fromtimestamp(time.time() + sleep_sec, tz=timezone.utc)
-                    logger.info("Next grid evaluation in %.1fs, at %s (timeframe=%s).",
-                                sleep_sec, next_run.strftime("%Y-%m-%d %H:%M:%S UTC"), self.cfg.timeframe)
-                    if await self._wait_or_stop(sleep_sec):
-                        break
-                await self._run_grid_evaluation()
+                equity = await self.exchange.fetch_total_equity()
             except Exception:
-                logger.exception(
-                    "Errore imprevisto nel grid scheduler loop -- il bot NON si ferma, riprovo al prossimo giro "
-                    "invece di lasciare che l'eccezione termini l'intero processo."
-                )
+                logger.exception("Lettura equity fallita: uso base_notional_usd=%.2f.", self.cfg.base_notional_usd)
+        base = effective_base_notional(equity, self.cfg.equity_based_sizing_percentage,
+                                       self.cfg.base_notional_usd, mins)
+        logger.info("Base notional per gamba: %.2f (equity %.2f x %.2f%%, minimi exchange %s).",
+                    base, equity, self.cfg.equity_based_sizing_percentage,
+                    {k: round(v, 2) for k, v in mins.items()})
+        return base
 
-    async def _run_grid_evaluation(self) -> None:
-        # Captured BEFORE any `await` below, so it reflects whichever cycle
-        # is actually current at the instant this evaluation started -- see
-        # `_execute_planned_order`'s re-check under the lock for why this
-        # matters (a slow exchange call further down can let a concurrent
-        # take-profit close+reopen finish while this evaluation is still in
-        # flight, computed against a cycle that no longer exists by the time
-        # it would otherwise execute).
-        evaluation_cycle_id = self.cycle_id
-        if self.cfg.stress_test_enabled:
-            try:
-                price = await self.exchange.fetch_mark_price()
-            except Exception:
-                logger.exception("Failed to fetch mark price for stress-test grid evaluation; skipping this window.")
-                return
-            ts_ms = int(time.time() * 1000)
-            logger.debug("[stress-test] Tick evaluation: mark=%.4f", price)
-        else:
-            try:
-                candle = await self.exchange.fetch_last_closed_candle()
-            except Exception:
-                logger.exception("Failed to fetch the last closed candle; skipping this evaluation window.")
-                return
-            price, ts_ms = candle.close, candle.timestamp_ms
-            logger.info("Candle closed (%s): ts=%d close=%.2f", self.cfg.timeframe, ts_ms, price)
-
-        max_fib_level = None if (self.cfg.stress_test_enabled and self.cfg.stress_test_unlimited_fib_level) \
-            else self.cfg.max_fib_level
-        breakeven_price = None if self.position.is_flat else self.position.avg_entry_price
-        base_notional = self._effective_base_notional(price)
-        order = evaluate_grid_close(price, self.grid, base_notional, max_fib_level,
-                                     self.cfg.sizing_ratio_start, self.cfg.sizing_ratio_increment_table,
-                                     breakeven_price)
-        if order is None:
-            logger.debug(
-                "Grid evaluation: close=%.4f sotto il Break-Even (%.4f) -- nessun ordine (mediazione sotto BE disabilitata).",
-                price, breakeven_price,
-            )
-            return
-        if order.range_offset in self._used_range_offsets:
-            logger.debug(
-                "Grid evaluation: close=%.4f -> Range %+d gia' utilizzato in questo ciclo -- nessun secondo ordine.",
-                price, order.range_offset,
-            )
-            return
-        seconds_since_cycle_open = time.monotonic() - self._cycle_opened_at
-        if seconds_since_cycle_open < ONE_ORDER_WINDOW_SEC:
-            logger.warning(
-                "Ordine scartato: solo %.2fs dall'apertura del ciclo (offset=%+d, fib_n=%d) -- consentito un "
-                "solo ordine nei primi %.0fs per proteggersi da eventuali ordini fantasma di un ciclo precedente.",
-                seconds_since_cycle_open, order.range_offset, order.fib_n, ONE_ORDER_WINDOW_SEC,
-            )
-            return
-        if self.cfg.stress_test_enabled and self.cfg.stress_test_neutral_zone_enabled:
-            if self._maybe_suspend_for_neutral_zone(price):
-                return
-        logger.debug("Grid evaluation: close=%.4f base_price=%.4f offset=%d -> fib_n=%d (%s)",
-                     price, self.grid.base_price, order.range_offset, order.fib_n, order.kind)
-        await self._execute_planned_order(order, price, ts_ms, evaluation_cycle_id)
-
-    def _maybe_suspend_for_neutral_zone(self, mark_price: float) -> bool:
-        """Neutral Zone (stress-test only): pauses Fibonacci accumulation
-        entries -- above OR below the fixed anchor alike, there is no more
-        "Range Shift" special case now that the grid never re-anchors mid-
-        cycle -- while the market price sits within
-        `stress_test_neutral_zone_percent`% of the Break-Even LORDO
-        (`avg_entry_price`; the Break-Even NETTO stays reserved for the
-        trailing-stop calculation). Buying more this close to break-even is
-        just fee churn with no strategic benefit. Bypassed unconditionally
-        whenever the current RSI(5m) reading is >= the overbought threshold --
-        a direct check on the live RSI value, independent of whether tick
-        mode is presently active or already turned off after a catch-up --
-        so a genuinely overbought market can still accumulate right through
-        the zone. Returns True if the caller should skip execution this
-        round."""
-        if self.position.is_flat:
-            return False
-        avg_entry = self.position.avg_entry_price
-        if avg_entry <= 0:
-            return False
-        dist_pct = abs(mark_price - avg_entry) / avg_entry * 100.0
-        if dist_pct >= self.cfg.stress_test_neutral_zone_percent:
-            return False
-
-        if self._rsi_overbought_now():
-            logger.info(
-                "Post Catch-up: Accumulo normale %.0fs con RSI >= %.1f (Neutral Zone bypassata, "
-                "distanza Break-Even=%.3f%% < %.2f%%).",
-                self.cfg.stress_test_base_interval_sec, self.cfg.stress_test_rsi_overbought_threshold,
-                dist_pct, self.cfg.stress_test_neutral_zone_percent,
-            )
-            return False
-
-        logger.debug(
-            "Neutral Zone attiva (In Pausa): distanza Break-Even=%.3f%% < %.2f%% -- entrata Fibonacci sospesa.",
-            dist_pct, self.cfg.stress_test_neutral_zone_percent,
-        )
-        return True
-
-    def _rsi_overbought_now(self) -> bool:
-        return (self._current_rsi is not None
-                and self._current_rsi >= self.cfg.stress_test_rsi_overbought_threshold)
-
-    async def _execute_planned_order(self, order: PlannedOrder, ref_price: float, ts_ms: int,
-                                      evaluation_cycle_id: int) -> None:
-        """Holds `_position_lock` for its entire body so a concurrent take-profit
-        close can never observe a half-added entry (or vice versa)."""
-        async with self._position_lock:
-            # `order` was computed by the caller against whatever cycle was
-            # current AT THAT TIME (`evaluation_cycle_id`) -- but this call
-            # may have been sitting here waiting for the lock while a
-            # take-profit close+reopen ran to completion (e.g. a slow/stuck
-            # `close_position_market()` call holds the lock for a long time
-            # on a bad connection). If the cycle has since moved on, `order`
-            # is stale: it was sized/classified against a grid and Break-Even
-            # that no longer exist, and executing it now would land a real
-            # order at whatever today's price is, right on top of the NEW
-            # cycle's own legitimate opening order -- exactly the
-            # duplicate-order-at-cycle-start symptom this closes, for any
-            # range, not just Range 0 (see `_used_range_offsets`, which only
-            # protects against a stale order for the SAME cycle).
-            if evaluation_cycle_id != self.cycle_id:
-                logger.warning(
-                    "Ordine scartato: calcolato per il ciclo #%d (offset=%+d, notional=%.2f), ma il ciclo "
-                    "attuale e' gia' #%d -- probabile chiusura/riapertura avvenuta mentre questo ordine "
-                    "era in coda per il lock.", evaluation_cycle_id, order.range_offset, order.notional_usdt,
-                    self.cycle_id,
-                )
-                return
-
-            # `compute_qty_from_notional` itself can raise `InvalidOrder` (CCXT's
-            # `amount_to_precision`) when notional/price rounds to LESS than one
-            # full precision step -- it doesn't clamp to zero, it throws. So the
-            # floor below must be reachable even when the raw computation never
-            # produces a usable qty at all, not just when it produces a qty that
-            # is merely "too small but still computable" (the previous version of
-            # this floor only handled the latter case).
-            try:
-                qty = self.exchange.compute_qty_from_notional(order.notional_usdt, ref_price)
-            except Exception:
-                logger.debug(
-                    "notional=%.2f @ prezzo=%.2f e sotto un intero step di precisione dell'exchange "
-                    "(quantita arrotondata a zero) -- alzo al minimo tradabile.",
-                    order.notional_usdt, ref_price,
-                )
-                qty = 0.0
-
-            # Floors qty up to the exchange's minimum tradable amount if the
-            # configured notional would compute a smaller size than that --
-            # e.g. base_notional_usdt=20 stops being enough once ETH trades
-            # above ~2000 (0.01 min * price). Without this, a rising price
-            # would eventually make every order raise InvalidOrder and kill
-            # the bot; this keeps it tradable at any price, indefinitely,
-            # instead of hard-coding price thresholds that would need manual
-            # updates forever.
-            min_qty = self.exchange.min_order_qty()
-            if min_qty > 0 and qty < min_qty:
-                logger.debug(
-                    "Qty %.6f (da notional=%.2f @ %.2f) sotto il minimo exchange %.6f -> alzata al minimo.",
-                    qty, order.notional_usdt, ref_price, min_qty,
-                )
-                qty = min_qty
-
-            if qty <= 0:
-                logger.warning("Computed qty <= 0 for notional=%.2f @ price=%.2f; skipping %s order.",
-                                order.notional_usdt, ref_price, order.kind)
-                return
-
-            try:
-                filled = await self.exchange.place_market_short(qty)
-            except Exception:
-                logger.exception("Failed to execute %s order (fib_n=%d, notional=%.2f)",
-                                  order.kind, order.fib_n, order.notional_usdt)
-                return
-
-            was_flat_before = self.position.is_flat
-            fee = self.fee_engine.taker_fee_for_notional(filled.notional_usdt)
-            self.position.add_entry(EntryFill(
-                price=filled.price, qty=filled.qty, notional_usdt=filled.notional_usdt,
-                taker_fee_usdt=fee, fib_level=order.fib_n, timestamp_ms=ts_ms,
-            ))
-            self.cycle_orders.append(OrderRecord(
-                timestamp_ms=ts_ms, fib_level=order.fib_n, kind=order.kind,
-                price=filled.price, qty=filled.qty, notional_usdt=filled.notional_usdt, fee_usdt=fee,
-            ))
-            logger.info("Grid order filled: kind=%s fib_n=%d qty=%.6f price=%.2f notional=%.2f fee=%.4f",
-                        order.kind, order.fib_n, filled.qty, filled.price, filled.notional_usdt, fee)
-
-            # Marks this range as used ONLY after a real fill -- a failed
-            # attempt (caught above) never reaches here, so that range stays
-            # eligible for a future try. Reset every new cycle (see
-            # _reset_state_after_close) so each cycle's ranges start fresh.
-            self._used_range_offsets.add(order.range_offset)
-
-            # Re-index Range 0 to the freshly-updated Break-Even -- skipped
-            # for the cycle's very first fill (was_flat_before), since at
-            # that instant Break-Even trivially equals the just-set anchor,
-            # which would spuriously re-index to -1 (see RangeGrid.reindex_
-            # to_breakeven's docstring for why). Also skipped entirely when
-            # `grid_reindex_enabled=False`: zero_index then stays at 0 for
-            # the whole cycle, so every offset (and therefore every
-            # Fibonacci level) is always measured from the cycle's ORIGINAL
-            # anchor instead of "resetting" every time Break-Even catches up
-            # to a new band -- Fibonacci sizes grow faster over a long,
-            # heavily-mediated cycle than with re-indexing enabled.
-            if not was_flat_before and self.cfg.grid_reindex_enabled:
-                old_zero_index = self.grid.zero_index
-                if self.grid.reindex_to_breakeven(self.position.avg_entry_price):
-                    logger.info(
-                        "Range 0 RE-INDICIZZATO al Break-Even: avg_entry=%.4f -> zero_index %d -> %d "
-                        "(quote di prezzo invariate, base_price=%.4f).",
-                        self.position.avg_entry_price, old_zero_index, self.grid.zero_index, self.grid.base_price,
-                    )
-
-    # -- tick loop: real-time net PnL + fixed take-profit target (rules 3, 8, 9) -
+    # -- main loop -----------------------------------------------------------
 
     async def _tick_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
-                await self._run_tick()
+                await self._tick()
             except Exception:
-                logger.exception("Error during tick evaluation")
+                logger.exception("Errore durante il tick")
             if await self._wait_or_stop(self.cfg.tick_poll_interval_sec):
                 break
 
-    async def _run_tick(self) -> None:
-        await self._maybe_poll_funding()
-        mark_price = await self.exchange.fetch_mark_price()
-        self._last_mark_price = mark_price
-
-        if self.cfg.stress_test_enabled and self.cfg.stress_test_rsi_enabled:
-            await self._maybe_update_rsi(mark_price)
-            await self._maybe_handle_rsi_tick_mode(mark_price)
-
-        margin_used = (self.position.total_notional / self.cfg.leverage) if not self.position.is_flat else 0.0
-        breakdown = compute_net_pnl(
-            avg_entry_price=self.position.avg_entry_price,
-            mark_price=mark_price,
-            qty=self.position.total_qty,
-            open_fees_usdt=self.position.total_open_fees,
-            fee_engine=self.fee_engine,
-            margin_used_usdt=margin_used,
-        )
-        self._export_state(mark_price, breakdown, margin_used)
-
-        if self.position.is_flat:
-            self._trailing_active = False
-            self._trailing_lowest_price = None
+    async def _tick(self) -> None:
+        if self._halted:
             return
-
-        if self.cfg.trailing_stop_enabled:
-            await self._maybe_handle_trailing_stop(mark_price)
-        else:
-            await self._maybe_handle_fixed_take_profit(mark_price)
-
-    async def _maybe_handle_fixed_take_profit(self, mark_price: float) -> None:
-        """Fixed take-profit (used when `trailing_stop.enabled` is false): closes
-        the whole position at market the instant mark_price first drops
-        `trailing_activation_pct`% below Break-Even NETTO. No arming, no
-        trailing -- it's a single fixed threshold, reusing the same field that
-        sets the trailing stop's activation distance when trailing is enabled."""
-        _, be_net = compute_breakeven_prices(self.position.entries, self.fee_engine)
-        if be_net <= 0:
-            return
-        tp_price = be_net * (1.0 - self.cfg.trailing_activation_pct / 100.0)
-        if mark_price <= tp_price:
-            logger.info(
-                "Take Profit COLPITO: mark=%.4f <= soglia=%.4f (%.2f%% sotto Break-Even NETTO).",
-                mark_price, tp_price, self.cfg.trailing_activation_pct,
-            )
-            await self._close_cycle(mark_price)
-
-    def _trailing_activation_price(self) -> float | None:
-        """SHORT profits as price falls, so the trailing stop arms the
-        instant mark_price first drops to `trailing_activation_pct`% BELOW
-        the net breakeven price -- never at entry."""
-        _, be_net = compute_breakeven_prices(self.position.entries, self.fee_engine)
-        if be_net <= 0:
-            return None
-        return be_net * (1.0 - self.cfg.trailing_activation_pct / 100.0)
-
-    def _trailing_stop_price(self) -> float | None:
-        """Current stop level: `trailing_distance_pct`% above the lowest
-        mark_price seen since the trailing stop armed. None if not active."""
-        if not self._trailing_active or self._trailing_lowest_price is None:
-            return None
-        return self._trailing_lowest_price * (1.0 + self.cfg.trailing_distance_pct / 100.0)
-
-    async def _maybe_handle_trailing_stop(self, mark_price: float) -> None:
-        """SHORT-only trailing stop (replaces the old fixed take profit).
-
-        Not active at entry: arms the instant `mark_price` first drops to
-        `trailing_activation_pct`% below Break-Even NETTO, pinning the
-        initial stop `trailing_distance_pct`% ABOVE that arming price. From
-        then on, every new low pulls the stop down with it (still
-        `distance_pct`% above the lowest mark_price seen since arming) --
-        the stop is monotonically non-increasing and never retraces upward
-        on a bounce. Closes the whole position at market the instant
-        `mark_price` rises back up to touch or cross the stop."""
-        if not self._trailing_active:
-            activation_price = self._trailing_activation_price()
-            if activation_price is None or mark_price > activation_price:
-                return
-            self._trailing_active = True
-            self._trailing_lowest_price = mark_price
-            logger.info(
-                "Trailing Stop ATTIVATO: mark=%.4f <= soglia attivazione=%.4f (%.2f%% sotto Break-Even NETTO) "
-                "-> stop iniziale=%.4f (%.2f%% sopra il prezzo di attivazione).",
-                mark_price, activation_price, self.cfg.trailing_activation_pct,
-                self._trailing_stop_price(), self.cfg.trailing_distance_pct,
-            )
-            return
-
-        if mark_price < self._trailing_lowest_price:
-            self._trailing_lowest_price = mark_price
-            logger.info("Trailing Stop: nuovo minimo=%.4f -> stop aggiornato a %.4f.",
-                        mark_price, self._trailing_stop_price())
-            return
-
-        stop_price = self._trailing_stop_price()
-        if stop_price is not None and mark_price >= stop_price:
-            logger.info("Trailing Stop COLPITO: mark=%.4f >= stop=%.4f (minimo raggiunto dopo l'attivazione=%.4f).",
-                        mark_price, stop_price, self._trailing_lowest_price)
-            await self._close_cycle(mark_price)
-
-    def _has_real_breakeven_gap(self, mark_price: float) -> bool:
-        """True only if the market has genuinely pulled AHEAD of (above) the
-        position's Break-Even price -- i.e. the SHORT is currently underwater
-        and there is real ground to recover, which is the only case tick
-        mode exists to accelerate. Deliberately one-directional (`>`, not
-        `!=`): if Break-Even already sits ABOVE the market (position already
-        in profit), an RSI crossing must NOT arm tick mode -- that would just
-        pile more short exposure onto an already-winning position with no
-        risk-based rationale, purely because RSI and a band mismatch happened
-        to coincide. Also covers the flat-position/standing-start case (no
-        gap, nothing to catch up from), and the redundant-reactivation case
-        an RSI dip-then-recross could otherwise cause when Break-Even has
-        already caught up. Mirrors the analogous arm guard the offset-based
-        re-anchor mechanism used."""
-        if self.position.is_flat:
-            return False
-        avg_entry = self.position.avg_entry_price
-        if avg_entry <= 0:
-            return False
-        mark_offset = self.grid.classify_offset(mark_price)
-        breakeven_offset = self.grid.classify_offset(avg_entry)
-        return mark_offset > breakeven_offset
-
-    async def _maybe_update_rsi(self, mark_price: float) -> None:
-        """Recomputes RSI at most once per `RSI_POLL_INTERVAL_SEC`, and only
-        actually updates state when that poll lands on a NEWLY closed
-        `stress_test_rsi_timeframe` candle (`_rsi_last_candle_ts` gate) --
-        the underlying candle hasn't changed in between, so recomputing more
-        often would just repeat the same reading for extra API calls.
-
-        Tick mode arms on an UPWARD CROSSING of the overbought threshold
-        (previous reading < threshold <= new reading), never on merely
-        *being* overbought -- so staying overbought across consecutive
-        candles does not keep re-triggering it; only a fresh crossing from
-        below does. A crossing is also ignored (no arm, no order) if
-        Break-Even and market price are already in the same grid band at
-        that moment -- see `_has_real_breakeven_gap`."""
-        now = time.time()
-        if now - self._last_rsi_poll_ts < RSI_POLL_INTERVAL_SEC:
-            return
-        self._last_rsi_poll_ts = now
-
-        try:
-            candles = await self.exchange.fetch_closed_candles(
-                self.cfg.stress_test_rsi_timeframe, self.cfg.stress_test_rsi_period * 4)
-        except Exception:
-            logger.exception("Failed to fetch candles for RSI computation; keeping last known RSI.")
-            return
-        if not candles:
-            return
-
-        latest_ts = candles[-1].timestamp_ms
-        if latest_ts == self._rsi_last_candle_ts:
-            return
-        self._rsi_last_candle_ts = latest_ts
-
-        rsi = compute_rsi([c.close for c in candles], self.cfg.stress_test_rsi_period)
-        if rsi is None:
-            return
-
-        prev = self._current_rsi
-        self._current_rsi = rsi
-        threshold = self.cfg.stress_test_rsi_overbought_threshold
-        crossed_up = prev is not None and prev < threshold <= rsi
-
-        if crossed_up and not self._rsi_tick_mode_active:
-            if self._has_real_breakeven_gap(mark_price):
-                self._rsi_tick_mode_active = True
-                logger.info("RSI >= %.1f: Tick Mode Attivato (RSI %s = %.1f)",
-                            threshold, self.cfg.stress_test_rsi_timeframe, rsi)
-            else:
-                logger.info(
-                    "[rsi-trigger] RSI %s = %.1f >= %.1f crossing ignored: Break-Even already in the same "
-                    "grid band as the market (no real gap to catch up) -- tick mode not armed.",
-                    self.cfg.stress_test_rsi_timeframe, rsi, threshold,
-                )
-        else:
-            logger.info("[rsi-trigger] RSI(%d, %s)=%.2f (threshold=%.1f)",
-                        self.cfg.stress_test_rsi_period, self.cfg.stress_test_rsi_timeframe, rsi, threshold)
-
-    async def _maybe_handle_rsi_tick_mode(self, mark_price: float) -> None:
-        """Stress-test only, deactivation half of the RSI trigger. While tick
-        mode is active, grid orders fire every `stress_test_tick_mode_interval_sec`
-        on the CURRENT band (relative to the cycle's fixed anchor), which
-        pulls the position's average entry price (break-even) with every
-        fill. Once break-even has caught up to the live market's grid band,
-        there is nothing left to accelerate: turn tick mode off and fall
-        back to the base cadence. The grid's anchor is NEVER touched here --
-        `RangeGrid.base_price` is fixed for the whole cycle (see
-        strategy.py's module docstring); this only ever changes the
-        scheduling cadence. A fresh RSI crossing is required to re-arm (see
-        `_maybe_update_rsi`) -- this method never turns tick mode back ON,
-        only off."""
-        if not self._rsi_tick_mode_active:
-            return
-        if self.position.is_flat:
-            return
-        avg_entry = self.position.avg_entry_price
-        if avg_entry <= 0:
-            return
-
-        mark_offset = self.grid.classify_offset(mark_price)
-        breakeven_offset = self.grid.classify_offset(avg_entry)
-        if mark_offset != breakeven_offset:
-            return
-
-        self._rsi_tick_mode_active = False
-        logger.info(
-            "Break-Even raggiunto: Tick Mode Disattivato (avg_entry=%.4f mark=%.4f, both in offset band %d "
-            "relative to fixed base_price=%.4f) -> frequency back to %.0fs. Griglia invariata.",
-            avg_entry, mark_price, mark_offset, self.grid.base_price,
-            self.cfg.stress_test_base_interval_sec,
-        )
-
-    async def _maybe_poll_funding(self) -> None:
-        """Pulls REALIZED funding settlements from the exchange's own ledger
-        (`fetch_realized_funding`) instead of estimating one from the current/
-        live funding rate on every poll. Bybit settles funding roughly every
-        8h, not continuously -- the previous approach polled the live rate
-        every `funding_poll_interval_sec` (300s) and recorded a NEW payment
-        on every single poll, which fabricated ~16 phantom funding payments
-        for a position held only ~80 minutes (confirmed live: this inflated
-        Break-Even NETTO enough to fire the fixed take-profit ~12 USDT too
-        early). `self._recorded_funding_ids` deduplicates by the exchange's
-        own settlement id, since polling can see the same real settlement
-        more than once before it ages out of the queried window. The query
-        window itself (`self._funding_since_ms`) advances past each processed
-        settlement rather than always re-querying from `cycle_start_ts_ms`,
-        so a cycle open for weeks never risks exceeding the API's page size
-        and silently dropping older settlements."""
-        if self.position.is_flat:
-            return
-        now = time.time()
-        if now - self._last_funding_poll_ts < self.cfg.funding_poll_interval_sec:
-            return
-        self._last_funding_poll_ts = now
-
-        since_ms = self._funding_since_ms if self._funding_since_ms is not None else self.cycle_start_ts_ms
-        try:
-            settlements = await self.exchange.fetch_realized_funding(since_ms=since_ms)
-        except Exception:
-            logger.exception("Failed to fetch realized funding history")
-            return
-
-        for funding_id, ts_ms, cashflow in settlements:
-            self._funding_since_ms = max(since_ms, ts_ms + 1, self._funding_since_ms or 0)
-            if funding_id in self._recorded_funding_ids:
-                continue
-            self._recorded_funding_ids.add(funding_id)
-            self.fee_engine.record_funding(FundingPayment(timestamp_ms=ts_ms, cashflow_usdt=cashflow))
-            logger.info("Funding realizzato registrato: id=%s cashflow=%.4f USDT", funding_id, cashflow)
-
-    # -- trailing stop / cycle reset -------------------------------------------
-
-    async def _close_cycle(self, mark_price: float) -> None:
-        """Holds `_position_lock` through snapshot -> exchange close -> cycle
-        recording -> state reset, so a concurrent grid evaluation can never add
-        an entry the close's PnL calculation doesn't account for (the bug that
-        previously made our recorded net_pnl diverge from Bybit's own realized
-        P&L whenever a candle-close evaluation landed at the same instant as a
-        trailing-stop trigger). The immediate re-open happens AFTER the lock is
-        released -- it goes through `_execute_planned_order`, which acquires
-        the same lock itself, so it cannot be taken while still held here."""
-        reset_ref_price: float | None = None
-        # Captured here, right after net_pnl is computed, so the Telegram
-        # notification (scheduled further below, only after the cycle is
-        # fully closed and reset) reports the CLOSED cycle's id -- reading
-        # self.cycle_id after `_reset_state_after_close` would give the NEW
-        # cycle's id instead, since that method increments it.
-        closed_cycle_id: int | None = None
-        closed_net_pnl: float | None = None
+        prices = await self.exchange.fetch_last_prices(l.symbol for l in self.cfg.legs.values())
+        marks = {name: prices[l.symbol] for name, l in self.cfg.legs.items()}
 
         async with self._position_lock:
-            qty = self.position.total_qty
-            avg_entry = self.position.avg_entry_price
-            open_fees = self.position.total_open_fees
-            max_fib = self.position.max_fib_level
-
-            try:
-                filled = await self.exchange.close_position_market()
-            except Exception:
-                logger.exception("Failed to close position at market on trailing-stop trigger")
+            if self._closing_tp_leg is not None:
+                await self._continue_close_all(marks)
                 return
 
-            if filled is None:
-                logger.error("Trailing stop triggered but no open position was found on the exchange; "
-                             "resetting local state only.")
-                reset_ref_price = mark_price
-            else:
-                # The exchange position is already closed at this point (the
-                # `close_position_market()` call above succeeded) -- from here
-                # on, `reset_ref_price` MUST end up set and `_reset_state_after_
-                # close` MUST run no matter what, even if recording the cycle's
-                # stats fails (e.g. a disk I/O error writing trade_history.json,
-                # plausible on flaky mobile storage). Otherwise the bot's local
-                # state would keep believing the old position is still open
-                # while the exchange is flat -- a silent desync, not just a
-                # missed log line.
-                reset_ref_price = filled.price
-                try:
-                    close_fee = self.fee_engine.taker_fee_for_notional(filled.notional_usdt)
-                    self.cycle_orders.append(OrderRecord(
-                        timestamp_ms=filled.timestamp_ms, fib_level=0, kind="close_tp",
-                        price=filled.price, qty=filled.qty, notional_usdt=filled.notional_usdt, fee_usdt=close_fee,
-                    ))
+            await self._ensure_legs_open(marks)
+            if len(self.legs) != len(self.cfg.legs):
+                self._export(marks)
+                return
 
-                    gross_pnl = (avg_entry - filled.price) * qty
-                    total_fees = open_fees + close_fee
-                    total_funding = self.fee_engine.total_funding_cashflow()
-                    net_pnl = gross_pnl - total_fees + total_funding
-                    closed_cycle_id = self.cycle_id
-                    closed_net_pnl = net_pnl
+            await self._maybe_poll_funding()
+            signal = check_take_profit(self.legs, marks, self.fees, self.cfg.take_profit_net_pct)
+            self._export(marks)
+            self._maybe_heartbeat(marks)
+            if signal is None:
+                return
 
-                    self.analytics.record_cycle(CycleRecord(
-                        cycle_id=self.cycle_id,
-                        start_ts_ms=self.cycle_start_ts_ms,
-                        end_ts_ms=filled.timestamp_ms,
-                        orders=self.cycle_orders,
-                        max_fib_level=max_fib,
-                        gross_pnl_usdt=gross_pnl,
-                        total_fees_usdt=total_fees,
-                        total_funding_usdt=total_funding,
-                        net_pnl_usdt=net_pnl,
-                        base_notional_at_start_usdt=self.base_notional_usdt,
-                    ))
-                    logger.info("TRAILING STOP: cycle=%d net_pnl=%.2f USDT (gross=%.2f fees=%.2f funding=%.2f)",
-                                self.cycle_id, net_pnl, gross_pnl, total_fees, total_funding)
-                except Exception:
-                    logger.exception(
-                        "Failed to record closed cycle stats (trade_history.json) -- resetting local state "
-                        "anyway since the exchange position is already closed; this cycle's stats are lost "
-                        "but the bot stays in sync with the exchange."
-                    )
+            bd = signal.breakdown
+            logger.info("TAKE PROFIT gamba %s: netto due gambe %.4f (%.3f%% su notional %.2f) = lordo %.4f "
+                        "- fee apertura %.4f - fee chiusura stimate %.4f + funding %.4f. CLOSE ALL.",
+                        signal.leg.upper(), bd.net_pnl, bd.net_pct, bd.notional, bd.gross_pnl,
+                        bd.open_fees, bd.close_fees_est, bd.funding)
+            self._closing_tp_leg = signal.leg
+            self._close_fills = {}
+            self._close_marks = dict(marks)
+            await self._continue_close_all(marks)
 
-            self._reset_state_after_close(reset_ref_price)
-
-        logger.debug("Reopening the new base SHORT immediately at market (no candle-close wait).")
-        await self._execute_immediate_base_order(kind="range_zero_reset_immediate")
-        # Wakes up `_grid_scheduler_loop` (if it's mid-wait on the base cadence)
-        # to abort and restart its countdown fresh from right now -- so the
-        # cycle's SECOND order lands exactly `stress_test_base_interval_sec`
-        # after this immediate first order, instead of the base cadence
-        # ticking on independently of cycle boundaries.
-        self._cadence_reset_event.set()
-
-        # Optional, fully isolated feature (see notifier.py): same pattern as
-        # eth_spot_accumulator.py -- local, deferred import wrapped in its own
-        # try/except (so deleting notifier.py degrades to a silent no-op
-        # instead of crashing), scheduled as a background task so a slow/
-        # hanging Telegram call can never delay anything here (everything
-        # relevant has already happened above by this point).
-        if closed_cycle_id is not None and closed_net_pnl is not None:
+    async def _ensure_legs_open(self, marks: Dict[str, float]) -> None:
+        missing = [name for name in self.cfg.legs if name not in self.legs]
+        if not missing or time.monotonic() < self._open_retry_after:
+            return
+        if not self.legs:
+            self.cycle_start_ts_ms = int(time.time() * 1000)
+            self._reset_funding_tracking()
+        for name in missing:
+            leg_cfg = self.cfg.legs[name]
+            target = self.seq.notionals[name]
+            qty = qty_for_notional(target, marks[name], self.exchange.qty_step(leg_cfg.symbol),
+                                   self.exchange.min_order_qty(leg_cfg.symbol))
             try:
-                import notifier
-                task = asyncio.create_task(notifier.notify_cycle_closed(
-                    self.exchange, self.cfg.notifier_enabled, closed_cycle_id, closed_net_pnl,
-                ))
-                self._background_tasks.add(task)
-                task.add_done_callback(self._background_tasks.discard)
+                filled = await self.exchange.open_position_market(leg_cfg.symbol, leg_cfg.side, qty)
             except Exception:
-                pass
+                logger.exception("Apertura %s %s fallita (qty=%.6f): riprovo tra %.0fs.",
+                                 leg_cfg.side.upper(), leg_cfg.symbol, qty, OPEN_RETRY_DELAY_SEC)
+                self._open_retry_after = time.monotonic() + OPEN_RETRY_DELAY_SEC
+                return
+            if filled.qty <= 0 or filled.price <= 0:
+                logger.error("Apertura %s senza fill valido (%s): riprovo tra %.0fs.", leg_cfg.symbol, filled,
+                             OPEN_RETRY_DELAY_SEC)
+                self._open_retry_after = time.monotonic() + OPEN_RETRY_DELAY_SEC
+                return
+            fee = filled.fee if filled.fee is not None else self.fees.taker_fee_for_notional(filled.notional)
+            self.legs[name] = LegPosition(name=name, symbol=leg_cfg.symbol, side=leg_cfg.side,
+                                          settle_coin=leg_cfg.settle_coin, qty=filled.qty,
+                                          entry_price=filled.price, open_fee=fee)
+            logger.info("Aperta %s %s: qty=%.6f @ %.2f (notional %.2f, target %.2f, fee %.4f) -- "
+                        "sequenza #%d passo %d, ciclo #%d.",
+                        leg_cfg.side.upper(), leg_cfg.symbol, filled.qty, filled.price, filled.notional,
+                        target, fee, self.seq.sequence_id, self.seq.step, self.seq.cycle_id)
 
-    def _reset_state_after_close(self, ref_price: float) -> None:
-        """Synchronous on purpose: called while `_position_lock` is held, so it
-        must not `await` (that would yield control mid-reset to another
-        coroutine waiting on the same lock -- fine for correctness since the
-        lock stays held, but pointless since there's no I/O here anyway).
-        Skips the legacy cycle-count auto-compound entirely when equity-based
-        sizing is enabled -- that path instead sets `base_notional_usdt`
-        itself, asynchronously, in `_maybe_update_base_notional_from_equity`
-        (called right after this, from `_execute_immediate_base_order`)."""
-        if not self.cfg.equity_based_sizing_enabled and self.cfg.auto_compound_enabled:
-            old = self.base_notional_usdt
-            self.base_notional_usdt *= (1.0 + self.cfg.auto_compound_percentage / 100.0)
-            logger.info("Auto-compound applied: base_notional_usdt %.2f -> %.2f", old, self.base_notional_usdt)
+    # -- close all + settlement ---------------------------------------------
 
-        self.position.clear()
-        self.fee_engine.reset()
-        self._recorded_funding_ids.clear()
-        self._used_range_offsets.clear()
-        self._funding_since_ms = None
+    async def _continue_close_all(self, marks: Dict[str, float]) -> None:
+        for name, leg in self.legs.items():
+            if name in self._close_fills:
+                continue
+            try:
+                filled = await self.exchange.close_position_market(leg.symbol)
+            except Exception:
+                logger.exception("Chiusura %s fallita: riprovo al prossimo tick.", leg.symbol)
+                return
+            if filled is None:
+                logger.error("Nessuna posizione trovata su %s in chiusura: uso il prezzo %.2f come uscita.",
+                             leg.symbol, marks[name])
+            self._close_fills[name] = filled
+            self._close_marks[name] = marks[name]
+        await self._settle_cycle()
 
-        self.grid.full_reset(ref_price)
-        self._rsi_tick_mode_active = False
+    async def _settle_cycle(self) -> None:
+        tp_leg = self._closing_tp_leg
+        seq = self.seq
+        leg_results = []
+        net_by_coin: Dict[str, float] = {}
+        for name, leg in self.legs.items():
+            filled = self._close_fills.get(name)
+            exit_price = filled.price if filled is not None and filled.price > 0 else self._close_marks[name]
+            close_fee = (filled.fee if filled is not None and filled.fee is not None
+                         else self.fees.taker_fee_for_notional(exit_price * leg.qty))
+            net = realized_leg_net(leg, exit_price, close_fee)
+            net_by_coin[leg.settle_coin] = net_by_coin.get(leg.settle_coin, 0.0) + net
+            leg_results.append(LegResult(
+                leg=name, symbol=leg.symbol, side=leg.side, settle_coin=leg.settle_coin, qty=leg.qty,
+                entry_price=leg.entry_price, exit_price=exit_price, notional=leg.notional,
+                gross_pnl=gross_pnl(leg.side, leg.entry_price, exit_price, leg.qty),
+                open_fee=leg.open_fee, close_fee=close_fee, funding=leg.funding, net_pnl=net,
+            ))
 
-        # Range 0 is claimed for the immediate re-open order RIGHT HERE,
-        # synchronously, while `_position_lock` is still held -- not left to
-        # be marked only after that order's fill confirms (which happens
-        # later, inside `_execute_planned_order`, awaited outside this lock).
-        # Without this, a concurrent grid evaluation landing in the gap
-        # between this reset and that fill would see Range 0 as "not yet
-        # used this cycle" and fire a second order at essentially the same
-        # price -- exactly the duplicate-order-at-cycle-start bug this fixes.
-        self._used_range_offsets.add(0)
-        self._trailing_active = False
-        self._trailing_lowest_price = None
+        seq.add_cycle_result(net_by_coin)
+        decision = decide_after_close(seq, tp_leg, self.cfg.winner_multiplier, self.cfg.loser_multiplier,
+                                      self.cfg.max_multiplier_steps)
+        logger.info("CLOSE ALL completato (ciclo #%d): netto ciclo %s | netto sequenza #%d %s (totale %.4f) "
+                    "-> %s", seq.cycle_id, _fmt(net_by_coin), seq.sequence_id, _fmt(seq.net_by_coin),
+                    seq.total_net, decision.action.upper())
 
-        self.cycle_id += 1
-        self.cycle_start_ts_ms = int(time.time() * 1000)
-        self.cycle_orders = []
-        logger.info("Cycle reset: new cycle_id=%d, restarted at Range 0 (base_price=%.4f).",
-                    self.cycle_id, self.grid.base_price)
+        spot_actions = []
+        if decision.action == NEW_SEQUENCE and self.cfg.settlement_enabled:
+            spot_actions = await self._spot_settlement(decision)
 
-    # -- dashboard export (rule 10) -------------------------------------------
-
-    def _export_state(self, mark_price: float, breakdown, margin_used: float) -> None:
-        be_gross, be_net = compute_breakeven_prices(self.position.entries, self.fee_engine)
-        live = LiveState(
-            timestamp_ms=int(time.time() * 1000),
-            symbol=self.cfg.symbol,
-            timeframe=self.cfg.timeframe,
-            cycle_id=self.cycle_id,
-            mark_price=mark_price,
-            avg_entry_price=self.position.avg_entry_price,
-            breakeven_gross_price=be_gross,
-            breakeven_net_price=be_net,
-            total_qty=self.position.total_qty,
-            total_notional_usdt=self.position.total_notional,
-            margin_used_usdt=margin_used,
-            current_fib_level=self.position.max_fib_level,
-            range_base_price=self.grid.base_price,
-            base_notional_usdt=self.base_notional_usdt,
-            gross_pnl_usdt=breakdown.gross_pnl_usdt,
-            net_pnl_usdt=breakdown.net_pnl_usdt,
-            net_pnl_pct_on_margin=breakdown.net_pnl_pct_on_margin,
-            open_fees_usdt=breakdown.open_fees_usdt,
-            estimated_close_fee_usdt=breakdown.estimated_close_fee_usdt,
-            funding_cashflow_usdt=breakdown.funding_cashflow_usdt,
-            trailing_stop_active=self._trailing_active,
-            trailing_activation_price=self._trailing_activation_price(),
-            trailing_lowest_price=self._trailing_lowest_price,
-            trailing_stop_price=self._trailing_stop_price(),
-            trailing_activation_pct=self.cfg.trailing_activation_pct,
-            trailing_distance_pct=self.cfg.trailing_distance_pct,
+        record = CycleRecord(
+            cycle_id=seq.cycle_id, sequence_id=seq.sequence_id, step=seq.step,
+            start_ts_ms=self.cycle_start_ts_ms, end_ts_ms=int(time.time() * 1000), tp_leg=tp_leg,
+            legs=leg_results, net_by_coin=net_by_coin, sequence_net_by_coin=dict(seq.net_by_coin),
+            decision=decision.action, spot_actions=spot_actions,
         )
-        self.exporter.export(live, self.cycle_orders)
+        try:
+            self.analytics.record_cycle(record)
+        except Exception:
+            logger.exception("Registrazione ciclo nello storico fallita (stato del bot comunque aggiornato).")
+        self._spawn_background("notifier", "notify_cycle_closed", self.exchange, self.cfg.notifier_enabled, record)
 
-    # -- helpers -----------------------------------------------------------
+        # -- next cycle --
+        if decision.action == NEW_SEQUENCE:
+            base = await self._compute_base_notional()
+            self.seq = SequenceState.new(base, sequence_id=seq.sequence_id + 1, cycle_id=seq.cycle_id + 1)
+        elif decision.action == MULTIPLY:
+            seq.notionals = decision.next_notionals
+            seq.step += 1
+            seq.cycle_id += 1
+        else:  # STOP
+            seq.cycle_id += 1
+            self._halted = True
+            logger.warning("max_multiplier_steps=%s raggiunto: %s resta FLAT e si ferma.",
+                           self.cfg.max_multiplier_steps, BOT_NAME)
+            self._notify_text("STOP", [f"max_multiplier_steps={self.cfg.max_multiplier_steps} raggiunto: "
+                                       "posizioni chiuse, nessuna riapertura."])
+            self._stop_event.set()
+
+        self.legs = {}
+        self._closing_tp_leg = None
+        self._close_fills = {}
+        self._close_marks = {}
+        self._reset_funding_tracking()
+        self._save_runtime_state()
+        if decision.action != STOP:
+            logger.info("Nuovo ciclo #%d (sequenza #%d passo %d): SHORT %.2f / LONG %.2f.",
+                        self.seq.cycle_id, self.seq.sequence_id, self.seq.step,
+                        self.seq.notionals["short"], self.seq.notionals["long"])
+            prices = await self.exchange.fetch_last_prices(l.symbol for l in self.cfg.legs.values())
+            await self._ensure_legs_open({n: prices[l.symbol] for n, l in self.cfg.legs.items()})
+
+    async def _spot_settlement(self, decision: Decision) -> list:
+        """Winning coin covers the losing coin's sequence loss via a SPOT
+        conversion on the stable pair (Bybit Demo rejects /v5/account/repay),
+        then buys BTC spot with the rest. Every step is best-effort: a failure
+        is logged and reported, never blocks the next cycle."""
+        actions = []
+        winner, loser = decision.winner_coin, decision.loser_coin
+        winner_profit = decision.btc_buy_amount + decision.repay_amount
+        plan = plan_spot_settlement(decision.repay_amount, winner_profit, self.cfg.spot_min_order_value)
+        actions.extend(plan.notes)
+        stable = self.cfg.stable_conversion_symbol  # e.g. "USDC/USDT"
+        base_coin, quote_coin = stable.split("/")
+
+        if plan.convert_amount > 0 and loser:
+            try:
+                if winner == quote_coin and loser == base_coin:
+                    f = await self.exchange.spot_market_buy_with_cost(stable, plan.convert_amount)
+                elif winner == base_coin and loser == quote_coin:
+                    f = await self.exchange.spot_market_sell(stable, plan.convert_amount)
+                else:
+                    raise ValueError(f"Coppia {stable} non adatta a convertire {winner}->{loser}")
+                msg = f"repay {loser}: convertiti {plan.convert_amount:.4f} {winner} ({f.side} {f.qty:.4f} @ {f.price:.5f})"
+                logger.info("Settlement: %s", msg)
+                actions.append(msg)
+            except Exception:
+                logger.exception("Settlement: conversione %s->%s fallita.", winner, loser)
+                actions.append(f"repay {loser} FALLITO")
+
+            try:
+                balances = await self.exchange.fetch_coin_balances()
+                borrow = balances[loser].borrow_amount if loser in balances else 0.0
+                if borrow > 0:
+                    if await self.exchange.repay_via_endpoint(loser, borrow):
+                        actions.append(f"repay endpoint {loser} {borrow:.4f} OK")
+                    else:
+                        logger.warning("Settlement: debito %s residuo %.6f dopo la conversione.", loser, borrow)
+                        actions.append(f"debito {loser} residuo {borrow:.6f}")
+            except Exception:
+                logger.warning("Settlement: verifica debito %s fallita.", loser, exc_info=True)
+
+        if plan.btc_buy_amount > 0:
+            spot_symbol = next(l.spot_btc_symbol for l in self.cfg.legs.values() if l.settle_coin == winner)
+            try:
+                f = await self.exchange.spot_market_buy_with_cost(spot_symbol, plan.btc_buy_amount)
+                msg = f"acquistati {f.qty:.6f} BTC su {spot_symbol} @ {f.price:.2f} ({plan.btc_buy_amount:.4f} {winner})"
+                logger.info("Settlement: %s", msg)
+                actions.append(msg)
+            except Exception:
+                logger.exception("Settlement: acquisto BTC spot su %s fallito.", spot_symbol)
+                actions.append(f"acquisto BTC su {spot_symbol} FALLITO")
+        return actions
+
+    # -- funding -------------------------------------------------------------
+
+    def _reset_funding_tracking(self) -> None:
+        self._funding_ids = {name: set() for name in self.cfg.legs}
+        self._funding_since_ms = {name: self.cycle_start_ts_ms for name in self.cfg.legs}
+        self._last_funding_poll = 0.0
+
+    async def _maybe_poll_funding(self) -> None:
+        """REALIZED funding from the exchange ledger (Bybit settles every 8h),
+        deduplicated by settlement id, with a per-leg window that advances past
+        each processed settlement."""
+        now = time.time()
+        if now - self._last_funding_poll < self.cfg.funding_poll_interval_sec:
+            return
+        self._last_funding_poll = now
+        for name, leg in self.legs.items():
+            since = self._funding_since_ms.get(name, self.cycle_start_ts_ms)
+            try:
+                settlements = await self.exchange.fetch_realized_funding(leg.symbol, since_ms=since)
+            except Exception:
+                logger.exception("Lettura funding realizzato %s fallita", leg.symbol)
+                continue
+            seen = self._funding_ids.setdefault(name, set())
+            for fid, ts, cashflow in settlements:
+                self._funding_since_ms[name] = max(self._funding_since_ms.get(name, since), ts + 1)
+                if fid in seen:
+                    continue
+                seen.add(fid)
+                leg.funding += cashflow
+                logger.info("Funding realizzato %s: %.6f %s", leg.symbol, cashflow, leg.settle_coin)
+
+    # -- export / helpers ----------------------------------------------------
+
+    def _export(self, marks: Dict[str, float]) -> None:
+        breakdowns = evaluate_legs(self.legs, marks, self.fees) if len(self.legs) == len(self.cfg.legs) else {}
+        live = {
+            "timestamp_ms": int(time.time() * 1000),
+            "bot": BOT_NAME,
+            "version": BOT_VERSION,
+            "sequence": self.seq.to_dict() if self.seq else None,
+            "cycle_start_ts_ms": self.cycle_start_ts_ms,
+            "take_profit_net_pct": self.cfg.take_profit_net_pct,
+            "legs": {
+                name: {
+                    "symbol": leg.symbol, "side": leg.side, "settle_coin": leg.settle_coin,
+                    "qty": leg.qty, "entry_price": leg.entry_price, "notional": leg.notional,
+                    "mark_price": marks.get(name), "open_fee": leg.open_fee, "funding": leg.funding,
+                    "two_leg_net": breakdowns[name].net_pnl if name in breakdowns else None,
+                    "two_leg_net_pct": breakdowns[name].net_pct if name in breakdowns else None,
+                }
+                for name, leg in self.legs.items()
+            },
+            "closing": self._closing_tp_leg,
+            "halted": self._halted,
+        }
+        self.exporter.export(live)
+
+    def _maybe_heartbeat(self, marks: Dict[str, float]) -> None:
+        now = time.monotonic()
+        if now - self._last_heartbeat < HEARTBEAT_INTERVAL_SEC:
+            return
+        self._last_heartbeat = now
+        bds = evaluate_legs(self.legs, marks, self.fees)
+        logger.info("Stato: ciclo #%d seq #%d passo %d | SHORT netto2g %.3f%% | LONG netto2g %.3f%% | "
+                    "obiettivo %.2f%%", self.seq.cycle_id, self.seq.sequence_id, self.seq.step,
+                    bds["short"].net_pct, bds["long"].net_pct, self.cfg.take_profit_net_pct)
+
+    def _notify_text(self, title: str, body: list) -> None:
+        self._spawn_background("notifier", "notify_text", self.exchange, self.cfg.notifier_enabled, title, body)
+
+    def _spawn_background(self, module: str, func: str, *args) -> None:
+        """Fire-and-forget optional feature (notifier): local import, own
+        try/except, strong reference kept until done -- it can never block or
+        crash the trading loop."""
+        try:
+            mod = __import__(module)
+            task = asyncio.create_task(getattr(mod, func)(*args))
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+        except Exception:
+            logger.debug("Task in background %s.%s non avviato.", module, func, exc_info=True)
 
     async def _wait_or_stop(self, timeout_sec: float) -> bool:
-        """Sleeps up to `timeout_sec`, returning True early if a shutdown was requested.
-        Also polls for STOP_SIGNAL_PATH (see module docstring / STOP_SIGNAL_PATH) so the
-        bot can be stopped cleanly from any shell in this directory -- no PID hunting,
-        no terminal reattachment -- on both Windows and Termux, e.g. `touch STOP`."""
         self._check_stop_file()
         try:
             await asyncio.wait_for(self._stop_event.wait(), timeout=timeout_sec)
@@ -1167,24 +496,22 @@ class GridBotOrchestrator:
             STOP_SIGNAL_PATH.unlink()
         except OSError:
             pass
-        logger.info("Stop-file '%s' rilevato: arresto pulito richiesto.", STOP_SIGNAL_PATH)
+        logger.info("File '%s' rilevato: arresto pulito (le posizioni restano aperte).", STOP_SIGNAL_PATH)
         self._stop_event.set()
+
+
+def _fmt(d: Dict[str, float]) -> str:
+    return ", ".join(f"{k} {v:+.4f}" for k, v in d.items()) or "-"
 
 
 async def _run() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    # DEBUG (per-2s tick evaluations, range-already-used skips, etc.) is off
-    # by default -- it floods the console on every device, Termux included.
-    # Turn it on only for a one-off diagnostic session with:
-    #   LOG_LEVEL=DEBUG python main.py
-    # Deliberately scoped to just the "eth_grid_bot" namespace, NOT the root
-    # logger: ccxt's own DEBUG output dumps full HTTP requests/responses
-    # including the X-BAPI-API-KEY header and per-request signature in
-    # plaintext, which must never land in a log file.
-    debug_level = os.environ.get("LOG_LEVEL", "").strip().upper() == "DEBUG"
-    logging.getLogger("eth_grid_bot").setLevel(logging.DEBUG if debug_level else logging.INFO)
+    # DEBUG only for the bot's own namespace (LOG_LEVEL=DEBUG): ccxt's own DEBUG
+    # output would dump signed requests, API key header included.
+    debug = os.environ.get("LOG_LEVEL", "").strip().upper() == "DEBUG"
+    logging.getLogger("btc_bot").setLevel(logging.DEBUG if debug else logging.INFO)
     cfg = StrategyConfig.load(CONFIG_PATH)
-    bot = GridBotOrchestrator(cfg)
+    bot = BtcBot(cfg)
     try:
         await bot.start()
     finally:
@@ -1195,7 +522,7 @@ def main() -> None:
     try:
         asyncio.run(_run())
     except KeyboardInterrupt:
-        logger.info("Shutdown requested by user (KeyboardInterrupt).")
+        logger.info("%s arrestato dall'utente (KeyboardInterrupt).", BOT_NAME)
 
 
 if __name__ == "__main__":
