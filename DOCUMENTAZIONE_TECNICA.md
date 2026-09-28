@@ -10,6 +10,8 @@ BTC bot apre insieme **due posizioni perpetual opposte** su Bitcoin:
 Leva **125x** su entrambe (massimo consentito su BTCPERP-USDC; BTCUSDT arriva a 150x), margine cross.
 Lavora su **Bybit Demo Trading** (`USE_TESTNET=true` in `.env`, default).
 
+> Nota: con importi uguali il primo ciclo chiude sempre in perdita (le due gambe si compensano, restano le fee), quindi il secondo giro è sempre moltiplicato.
+
 > Il progetto deriva dal grid bot ETH (tag git `pre-btc-bot-v2` = stato di partenza) ma è un progetto separato:
 > repository GitHub `proy84/BTC-bot` (remote git `btcbot`), branch `btc-bot-v2`.
 > Il remote `origin` (eth_grid_bot) ha il push disattivato.
@@ -64,7 +66,7 @@ netto_X = PnL_lordo_X
         − fee chiusura stimate ai prezzi correnti (short + long)
         + funding realizzato (short + long)
 
-TP su X  ⇔  netto_X ≥ take_profit_net_pct% × notional_X      (default 0,20%)
+TP su X  ⇔  netto_X ≥ take_profit_net_pct% × notional_X      (attuale 0,50%)
 ```
 
 La gamba che fa TP paga **l'intero giro** di entrambe le posizioni, non solo le proprie fee. USDT e USDC sono sommati 1:1.
@@ -76,8 +78,7 @@ Al TP il bot chiude **entrambe** le gambe a mercato (`reduceOnly`). Se una chius
 Netto realizzato per gamba = lordo − fee apertura − fee chiusura reale + funding, nella propria moneta. Si somma al netto della sequenza.
 
 ### 3.4 Decisione dopo il CLOSE ALL (`strategy.decide_after_close`)
-- **a) Sequenza in guadagno netto** (netto USDT + netto USDC della sequenza **> 0**) → `new_sequence`:
-  la moneta con netto maggiore è la vincente; copre la perdita dell'altra (repay) e con il resto compra BTC spot; poi nuova sequenza al base notional (ricalcolato dall'equity), senza moltiplicatori.
+- **a) Ripaga + margine per BTC** → `new_sequence`: la moneta con il netto di sequenza maggiore (vincente) deve riuscire a **ripagare tutta la perdita dell'altra** (conversione spot, alzata al minimo di 5,10 se più piccola) **e** avere ancora **almeno il minimo ordine spot (5)** per comprare BTC. Solo allora: repay, acquisto BTC spot col resto, nuova sequenza al base notional (ricalcolato dall'equity), senza moltiplicatori. Un netto di sequenza positivo ma insufficiente (es. USDT +7 / USDC −2,5 → dopo il repay restano 1,9) **non** basta: si continua con i moltiplicatori.
 - **b) Altrimenti** → `multiply`: moltiplicatori **cumulativi** per gamba — gamba che ha fatto TP = suo importo precedente × `multipliers.winner` (2,0), l'altra = suo importo precedente × `multipliers.loser` (1,5). Sempre.
 - **Tetto** `max_multiplier_steps`: `null` = nessun limite (default, fase di stress test). Se impostato a N e la riapertura supererebbe N passi → `stop`: posizioni chiuse, nessuna riapertura, notifica, il bot si ferma.
 
@@ -126,7 +127,7 @@ Al riavvio:
 | `legs.short/long` | vedi tabella iniziale | simbolo, lato, moneta di regolamento, coppia spot BTC |
 | `leverage` | 125 | leva su entrambe le gambe |
 | `margin_mode` | `cross` | |
-| `take_profit_net_pct` | 0.20 | soglia TP netto su due gambe, % del notional della gamba |
+| `take_profit_net_pct` | 0.50 | soglia TP netto su due gambe, % del notional della gamba |
 | `fees.taker_rate` / `maker_rate` | 0.00055 / 0.0002 | per stime (le fee reali vengono dai fill) |
 | `equity_based_sizing.enabled` / `percentage` | true / 1.0 | base notional = % dell'equity totale |
 | `base_notional_usd` | 1.0 | ripiego se la lettura equity fallisce |
@@ -149,7 +150,7 @@ Mantenuti e adattati: retry con dedup per `clientOrderId`, lock delle posizioni,
 ---
 
 ## 8. Test
-`python -m pytest` — 36 test:
+`python -m pytest` — 39 test:
 - `tests/test_take_profit_net.py`: soglie esatte TP short/long, fee di entrambe le gambe, funding di entrambe, notional diversi per gamba.
 - `tests/test_multipliers.py`: sequenza di riferimento, cumulatività, parametri, arrotondamento quantità.
 - `tests/test_cycle_decision.py`: nuova sequenza vs moltiplicatori, zero non è guadagno, `max_multiplier_steps`, sequenza completa fino al reset, piano spot con minimi.

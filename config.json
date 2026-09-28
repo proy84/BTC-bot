@@ -29,7 +29,7 @@
   "margin_mode": "cross",
 
   "_comment_take_profit": "Una gamba fa TP quando il suo PnL lordo, meno le fee (apertura + chiusura stimata) di ENTRAMBE le gambe, piu' il funding realizzato di ENTRAMBE, e' >= take_profit_net_pct% del notional della gamba stessa. Al TP: CLOSE ALL.",
-  "take_profit_net_pct": 0.20,
+  "take_profit_net_pct": 0.50,
 
   "fees": {
     "taker_rate": 0.00055,
@@ -43,14 +43,14 @@
   },
   "base_notional_usd": 1.0,
 
-  "_comment_multipliers": "Se dopo il CLOSE ALL la sequenza non e' in guadagno netto (USDT + USDC <= 0): riapre con moltiplicatori CUMULATIVI per gamba -- gamba che ha fatto TP = importo precedente x winner, l'altra = importo precedente x loser. max_multiplier_steps: null = nessun limite; un intero N = dopo N riaperture moltiplicate il bot chiude tutto e si ferma.",
+  "_comment_multipliers": "Se dopo il CLOSE ALL la moneta vincente NON riesce a ripagare la perdita dell'altra lasciando almeno settlement.spot_min_order_value (5) per comprare BTC spot: riapre con moltiplicatori CUMULATIVI per gamba -- gamba che ha fatto TP = importo precedente x winner, l'altra = importo precedente x loser. max_multiplier_steps: null = nessun limite; un intero N = dopo N riaperture moltiplicate il bot chiude tutto e si ferma.",
   "multipliers": {
     "winner": 2.0,
     "loser": 1.5
   },
   "max_multiplier_steps": null,
 
-  "_comment_settlement": "Sequenza in guadagno netto: la moneta vincente copre la perdita dell'altra con una conversione SPOT su stable_conversion_symbol (su Bybit Demo /v5/account/repay non e' supportato), poi col resto compra BTC spot. Ordini spot sotto spot_min_order_value (minimo Bybit 5) vengono alzati al minimo (repay) o saltati (acquisto BTC). enabled=false: nessuna operazione spot, solo reset a base.",
+  "_comment_settlement": "Nuova sequenza solo se la moneta vincente ripaga l'altra E le restano almeno spot_min_order_value per il BTC: la moneta vincente copre la perdita dell'altra con una conversione SPOT su stable_conversion_symbol (su Bybit Demo /v5/account/repay non e' supportato), poi col resto compra BTC spot. Ordini spot sotto spot_min_order_value (minimo Bybit 5) vengono alzati al minimo (repay) o saltati (acquisto BTC). enabled=false: nessuna operazione spot, solo reset a base.",
   "settlement": {
     "enabled": true,
     "stable_conversion_symbol": "USDC/USDT",
