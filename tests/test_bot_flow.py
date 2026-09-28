@@ -81,7 +81,7 @@ def bot(tmp_path, monkeypatch):
     monkeypatch.setattr(bot_main, "ExchangeClient", FakeExchange)
     cfg = dataclasses.replace(
         StrategyConfig.load("config.json"),
-        notifier_enabled=False, use_testnet=True,
+        notifier_enabled=False, use_testnet=True, take_profit_net_pct=0.20,
         trade_history_path=str(tmp_path / "hist.json"),
         state_export_path=str(tmp_path / "live.json"),
         runtime_state_path=str(tmp_path / "state.json"),
@@ -122,15 +122,27 @@ def test_full_flow(bot, tmp_path):
         saved = json.loads((tmp_path / "state.json").read_text())
         assert saved["step"] == 1 and saved["notionals"]["long"] == pytest.approx(200.0)
 
-        # Cycle 2: TP long again -> sequence USDT+USDC > 0 -> new sequence at base
+        # Cycle 2: TP long again, small move -> sequence slightly positive but the
+        # USDC profit cannot repay USDT AND leave 5 for BTC -> multipliers again
         set_price(bot, 101_100.0)
         await bot._tick()
         c2 = bot.analytics.cycles[-1]
-        assert c2.decision == NEW_SEQUENCE
-        assert sum(c2.sequence_net_by_coin.values()) > 0
-        # winner profit (~1.4 USDC) is below the 5 USDC spot minimum -> no spot orders
+        assert c2.tp_leg == LONG_LEG and c2.decision == MULTIPLY
         assert bot.exchange.spot_calls == []
-        assert any("saltat" in a for a in c2.spot_actions)
+        assert bot.seq.step == 2
+        assert bot.seq.notionals == pytest.approx({SHORT_LEG: 225.0, LONG_LEG: 400.0})
+
+        # Cycle 3: big move up -> USDC repays the USDT loss and has >= 5 left for BTC
+        set_price(bot, 115_000.0)
+        await bot._tick()
+        c3 = bot.analytics.cycles[-1]
+        assert c3.decision == NEW_SEQUENCE
+        seq_net = c3.sequence_net_by_coin
+        assert seq_net["USDC"] > 0 > seq_net["USDT"]
+        (k1, sym1, amt1), (k2, sym2, amt2) = bot.exchange.spot_calls
+        assert (k1, sym1) == ("sell", "USDC/USDT") and amt1 == pytest.approx(-seq_net["USDT"])
+        assert (k2, sym2) == ("buy", "BTC/USDC") and amt2 == pytest.approx(sum(seq_net.values()))
+        assert amt2 >= 5.0
         assert bot.seq.sequence_id == 2 and bot.seq.step == 0
         assert bot.seq.notionals[SHORT_LEG] == bot.seq.notionals[LONG_LEG]
         assert set(bot.exchange.positions) == {SHORT_SYM, LONG_SYM}

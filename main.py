@@ -13,8 +13,9 @@ Loop (every `polling.tick_poll_interval_sec`), always under `_position_lock`:
      (`strategy.check_take_profit`). A hit starts CLOSE ALL.
   4. Settlement: realized net per coin -> sequence totals -> decision
      (`strategy.decide_after_close`):
-       - NEW_SEQUENCE: repay the losing coin via a spot conversion from the
-         winning coin, buy BTC spot with the rest, restart at base notional;
+       - NEW_SEQUENCE (only when the winning coin can repay the losing coin
+         AND has >= the spot minimum left for BTC): repay via a spot
+         conversion, buy BTC spot with the rest, restart at base notional;
        - MULTIPLY: cumulative per-leg multipliers (TP leg x2, other x1.5);
        - STOP (only if max_multiplier_steps is set): stay flat and halt.
      Then the next cycle opens immediately.
@@ -296,7 +297,7 @@ class BtcBot:
 
         seq.add_cycle_result(net_by_coin)
         decision = decide_after_close(seq, tp_leg, self.cfg.winner_multiplier, self.cfg.loser_multiplier,
-                                      self.cfg.max_multiplier_steps)
+                                      self.cfg.max_multiplier_steps, self.cfg.spot_min_order_value)
         logger.info("CLOSE ALL completato (ciclo #%d): netto ciclo %s | netto sequenza #%d %s (totale %.4f) "
                     "-> %s", seq.cycle_id, _fmt(net_by_coin), seq.sequence_id, _fmt(seq.net_by_coin),
                     seq.total_net, decision.action.upper())
@@ -354,8 +355,8 @@ class BtcBot:
         is logged and reported, never blocks the next cycle."""
         actions = []
         winner, loser = decision.winner_coin, decision.loser_coin
-        winner_profit = decision.btc_buy_amount + decision.repay_amount
-        plan = plan_spot_settlement(decision.repay_amount, winner_profit, self.cfg.spot_min_order_value)
+        plan = decision.plan or plan_spot_settlement(
+            decision.repay_amount, decision.btc_buy_amount + decision.repay_amount, self.cfg.spot_min_order_value)
         actions.extend(plan.notes)
         stable = self.cfg.stable_conversion_symbol  # e.g. "USDC/USDT"
         base_coin, quote_coin = stable.split("/")

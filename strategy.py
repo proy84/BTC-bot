@@ -21,9 +21,9 @@ Rules:
     of BOTH legs plus the realized funding of BOTH legs is >= take_profit_net_pct
     of that leg's notional (`check_take_profit`).
   - After CLOSE ALL (`decide_after_close`):
-      a) sequence net USDT + USDC > 0 -> the winning coin repays the losing
-         coin's loss (spot conversion), the rest buys BTC spot, and a new
-         sequence starts at the base notional on both legs;
+      a) the winning coin can repay the losing coin's sequence loss (spot
+         conversion) AND still has at least the spot minimum order (5) left
+         to buy BTC spot -> repay, buy BTC, new sequence at base notional;
       b) otherwise -> reopen with CUMULATIVE per-leg multipliers: the leg that
          hit TP = its previous notional x winner_multiplier (2.0), the other
          = its previous notional x loser_multiplier (1.5).
@@ -255,26 +255,34 @@ class Decision:
     loser_coin: Optional[str] = None
     repay_amount: float = 0.0         # losing coin's sequence loss, to be covered by the winner
     btc_buy_amount: float = 0.0       # rest of the winner's profit, to buy BTC spot
+    plan: Optional["SpotSettlementPlan"] = None  # exact spot orders for NEW_SEQUENCE
 
 
 def decide_after_close(seq: SequenceState, tp_leg: str, winner_multiplier: float,
-                       loser_multiplier: float, max_multiplier_steps: Optional[int]) -> Decision:
+                       loser_multiplier: float, max_multiplier_steps: Optional[int],
+                       spot_min_order_value: float) -> Decision:
     """Call AFTER `seq.add_cycle_result(...)` for the cycle just closed.
 
-    a) The sequence is in net profit (USDT + USDC > 0): the coin with the
-       larger net is the winner; it repays the loser's loss (if any) and the
-       rest buys BTC spot. New sequence at base notional.
+    a) The winning coin (larger sequence net) can REPAY the losing coin's loss
+       AND still has at least the spot minimum order left to buy BTC (the
+       exact orders are computed by `plan_spot_settlement`, including the
+       repay being rounded up to the spot minimum): new sequence at base.
     b) Otherwise: cumulative multipliers. If `max_multiplier_steps` is set and
        this reopen would exceed it -> STOP (None = no limit)."""
-    if seq.total_net > 0 and seq.net_by_coin:
+    if seq.net_by_coin:
         winner = max(seq.net_by_coin, key=lambda c: seq.net_by_coin[c])
         losers = [c for c in seq.net_by_coin if c != winner]
         loser = losers[0] if losers else None
+        winner_profit = seq.net_by_coin[winner]
         repay = max(0.0, -seq.net_by_coin[loser]) if loser else 0.0
-        return Decision(
-            action=NEW_SEQUENCE, next_notionals={}, winner_coin=winner, loser_coin=loser,
-            repay_amount=repay, btc_buy_amount=seq.net_by_coin[winner] - repay,
-        )
+        if winner_profit > 0:
+            plan = plan_spot_settlement(repay, winner_profit, spot_min_order_value)
+            can_repay = repay <= 0 or plan.convert_amount >= repay
+            if can_repay and plan.btc_buy_amount > 0:
+                return Decision(
+                    action=NEW_SEQUENCE, next_notionals={}, winner_coin=winner, loser_coin=loser,
+                    repay_amount=repay, btc_buy_amount=plan.btc_buy_amount, plan=plan,
+                )
     if max_multiplier_steps is not None and seq.step + 1 > max_multiplier_steps:
         return Decision(action=STOP, next_notionals={})
     return Decision(

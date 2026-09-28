@@ -8,10 +8,11 @@ from strategy import (
 )
 
 W, L = 2.0, 1.5
+MIN = 5.0  # minimo ordine spot Bybit
 
 
 def decide(seq, tp_leg, max_steps=None):
-    return decide_after_close(seq, tp_leg, W, L, max_steps)
+    return decide_after_close(seq, tp_leg, W, L, max_steps, MIN)
 
 
 def test_net_loss_on_sequence_means_multiply():
@@ -28,23 +29,50 @@ def test_exactly_zero_is_not_a_gain():
     assert decide(seq, LONG_LEG).action == MULTIPLY
 
 
-def test_net_gain_means_new_sequence_with_repay_and_btc_buy():
+def test_repay_and_btc_margin_means_new_sequence():
     seq = SequenceState.new(100.0)
-    seq.add_cycle_result({"USDT": 7.0, "USDC": -2.5})
+    seq.add_cycle_result({"USDT": 20.0, "USDC": -12.0})
     d = decide(seq, SHORT_LEG)
     assert d.action == NEW_SEQUENCE
     assert d.winner_coin == "USDT" and d.loser_coin == "USDC"
-    assert d.repay_amount == pytest.approx(2.5)
-    assert d.btc_buy_amount == pytest.approx(4.5)   # 7.0 - 2.5 = sequence net profit
+    assert d.repay_amount == pytest.approx(12.0)
+    assert d.plan.convert_amount == pytest.approx(12.0)
+    assert d.btc_buy_amount == pytest.approx(8.0)   # 20 - 12 = sequence net profit, >= 5
     assert d.next_notionals == {}                   # base is re-read from equity
+
+
+def test_sequence_positive_but_btc_rest_below_minimum_means_multiply():
+    """Net positive (+4.5) but after repaying 2.5 (rounded up to the 5.1 spot
+    minimum) only 1.9 would be left for BTC: below 5 -> keep multiplying."""
+    seq = SequenceState.new(100.0)
+    seq.add_cycle_result({"USDT": 7.0, "USDC": -2.5})
+    d = decide(seq, SHORT_LEG)
+    assert d.action == MULTIPLY
+    assert d.next_notionals == {SHORT_LEG: 200.0, LONG_LEG: 150.0}
+
+
+def test_small_repay_rounded_up_still_leaves_btc_margin():
+    seq = SequenceState.new(100.0)
+    seq.add_cycle_result({"USDT": 11.0, "USDC": -2.0})
+    d = decide(seq, SHORT_LEG)
+    assert d.action == NEW_SEQUENCE
+    assert d.plan.convert_amount == pytest.approx(5.1)
+    assert d.btc_buy_amount == pytest.approx(5.9)
+
+
+def test_winner_profit_below_minimum_means_multiply():
+    seq = SequenceState.new(100.0)
+    seq.add_cycle_result({"USDT": 3.0, "USDC": 1.0})
+    assert decide(seq, SHORT_LEG).action == MULTIPLY
 
 
 def test_both_coins_positive_no_repay():
     seq = SequenceState.new(100.0)
-    seq.add_cycle_result({"USDT": 3.0, "USDC": 1.0})
+    seq.add_cycle_result({"USDT": 6.0, "USDC": 1.0})
     d = decide(seq, SHORT_LEG)
     assert d.action == NEW_SEQUENCE and d.winner_coin == "USDT"
-    assert d.repay_amount == 0.0 and d.btc_buy_amount == pytest.approx(3.0)
+    assert d.repay_amount == 0.0 and d.plan.convert_amount == 0.0
+    assert d.btc_buy_amount == pytest.approx(6.0)
 
 
 def test_no_step_limit_by_default():
