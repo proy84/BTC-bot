@@ -1,9 +1,14 @@
 __pycache__/
 *.pyc
+.pytest_cache/
 .env
 *.log
 *.txt
 !requirements.txt
+!requirements-dev.txt
 /STOP
 /bot_state.json
 /trade_history.json
+/btc_bot_state.json
+/btc_bot_live.json
+/btc_bot_history.json

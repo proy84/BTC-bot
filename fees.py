@@ -1,25 +1,28 @@
 """
 fees.py
 
-Fee & funding accounting for the Only-Short ETH/USDT grid bot.
+Fee, funding and PnL math for BTC bot (two-leg hedge: BTC/USDT SHORT +
+BTC/USDC LONG). Pure functions, no exchange I/O.
 
-Responsibilities:
-  - Taker fee calculation for opening fills and estimated market-close fees.
-  - Funding cashflow tracking: `FundingPayment.cashflow_usdt` is a REALIZED
-    settlement amount read from the exchange's own ledger (see
-    `ExchangeClient.fetch_realized_funding` / `main._maybe_poll_funding`),
-    positive = received, negative = paid -- never derived locally from a
-    polled rate times notional (that approach fabricated a payment on every
-    poll regardless of whether Bybit had actually settled funding yet).
-  - Net PnL breakdown (gross - open fees - estimated close fee + funding).
-  - Break-even price calculation, both gross (average entry) and net
-    (the close price at which realized net PnL is exactly zero).
+Conventions:
+  - Every amount is in the leg's own settlement coin (USDT for the short
+    leg, USDC for the long leg). Where the two legs are summed together
+    (the two-leg net used for the take profit) USDT and USDC are treated
+    1:1 -- both are USD stablecoins, and the TP threshold is small enough
+    that a sub-0.1% depeg is immaterial.
+  - Funding cashflow is REALIZED funding read from the exchange's own
+    settlement ledger (`ExchangeClient.fetch_realized_funding`), positive =
+    received, negative = paid -- never estimated from a polled rate.
+  - Fees are positive costs.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import List, Sequence, Tuple
+from dataclasses import dataclass
+from typing import Mapping
+
+LONG = "long"
+SHORT = "short"
 
 
 @dataclass(frozen=True)
@@ -27,113 +30,82 @@ class FeeSchedule:
     taker_rate: float
     maker_rate: float = 0.0
 
-
-@dataclass(frozen=True)
-class FundingPayment:
-    """A single REALIZED funding settlement, as reported by the exchange's own
-    ledger (`ExchangeClient.fetch_realized_funding`) -- `cashflow_usdt` is the
-    real amount already credited/debited to the account for that settlement,
-    not an estimate derived from a polled rate. Positive = good for our SHORT
-    book (received), negative = paid."""
-    timestamp_ms: int
-    cashflow_usdt: float
-
-
-@dataclass(frozen=True)
-class EntryFill:
-    price: float
-    qty: float
-    notional_usdt: float
-    taker_fee_usdt: float
-    fib_level: int
-    timestamp_ms: int
+    def taker_fee_for_notional(self, notional: float) -> float:
+        return abs(notional) * self.taker_rate
 
 
 @dataclass
-class FeeEngine:
-    schedule: FeeSchedule
-    funding_payments: List[FundingPayment] = field(default_factory=list)
+class LegPosition:
+    """One open leg of the hedge, as the bot tracks it locally."""
+    name: str            # "short" | "long" -- the leg's key in the config
+    symbol: str          # e.g. "BTC/USDT:USDT"
+    side: str            # SHORT | LONG
+    settle_coin: str     # "USDT" | "USDC"
+    qty: float
+    entry_price: float
+    open_fee: float
+    funding: float = 0.0  # realized funding cashflow accumulated while open
 
-    def taker_fee_for_notional(self, notional_usdt: float) -> float:
-        return abs(notional_usdt) * self.schedule.taker_rate
+    @property
+    def notional(self) -> float:
+        return self.entry_price * self.qty
 
-    def estimate_close_fee(self, notional_to_close_usdt: float) -> float:
-        return self.taker_fee_for_notional(notional_to_close_usdt)
 
-    def record_funding(self, payment: FundingPayment) -> None:
-        self.funding_payments.append(payment)
+def gross_pnl(side: str, entry_price: float, exit_price: float, qty: float) -> float:
+    """Gross PnL of a linear perpetual leg: a SHORT profits when price falls,
+    a LONG when it rises."""
+    if side == SHORT:
+        return (entry_price - exit_price) * qty
+    if side == LONG:
+        return (exit_price - entry_price) * qty
+    raise ValueError(f"Unknown side: {side!r}")
 
-    def total_funding_cashflow(self) -> float:
-        return sum(p.cashflow_usdt for p in self.funding_payments)
 
-    def reset(self) -> None:
-        self.funding_payments.clear()
+def estimate_close_fee(leg: LegPosition, mark_price: float, schedule: FeeSchedule) -> float:
+    """Taker fee the leg would pay to close at market at `mark_price`."""
+    return schedule.taker_fee_for_notional(mark_price * leg.qty)
 
 
 @dataclass(frozen=True)
-class NetPnlBreakdown:
-    gross_pnl_usdt: float
-    open_fees_usdt: float
-    estimated_close_fee_usdt: float
-    funding_cashflow_usdt: float
-    net_pnl_usdt: float
-    net_pnl_pct_on_margin: float
+class TwoLegNet:
+    """Net result of ONE leg once the costs of BOTH legs are charged to it --
+    the quantity the take profit is measured on."""
+    leg: str
+    gross_pnl: float        # this leg only
+    open_fees: float        # both legs
+    close_fees_est: float   # both legs, estimated at the current marks
+    funding: float          # both legs (positive = received)
+    net_pnl: float          # gross - open_fees - close_fees_est + funding
+    notional: float         # this leg's entry notional
+    net_pct: float          # net_pnl / notional * 100
 
 
-def compute_gross_pnl_short(avg_entry_price: float, mark_price: float, qty: float) -> float:
-    """Gross PnL for a SHORT: profits when mark_price falls below avg_entry_price."""
-    return (avg_entry_price - mark_price) * qty
-
-
-def compute_net_pnl(
-    *,
-    avg_entry_price: float,
-    mark_price: float,
-    qty: float,
-    open_fees_usdt: float,
-    fee_engine: FeeEngine,
-    margin_used_usdt: float,
-) -> NetPnlBreakdown:
-    """Net PnL netted against real opening fees, an estimated taker close fee at
-    the current mark price, and accumulated funding cashflow."""
-    gross = compute_gross_pnl_short(avg_entry_price, mark_price, qty)
-    notional_to_close = mark_price * qty
-    close_fee_est = fee_engine.estimate_close_fee(notional_to_close)
-    funding_cf = fee_engine.total_funding_cashflow()
-    net = gross - open_fees_usdt - close_fee_est + funding_cf
-    net_pct = (net / margin_used_usdt * 100.0) if margin_used_usdt else 0.0
-    return NetPnlBreakdown(
-        gross_pnl_usdt=gross,
-        open_fees_usdt=open_fees_usdt,
-        estimated_close_fee_usdt=close_fee_est,
-        funding_cashflow_usdt=funding_cf,
-        net_pnl_usdt=net,
-        net_pnl_pct_on_margin=net_pct,
+def two_leg_net(legs: Mapping[str, LegPosition], marks: Mapping[str, float], leg_name: str,
+                schedule: FeeSchedule) -> TwoLegNet:
+    """Net PnL of `leg_name` after subtracting the opening AND (estimated)
+    closing fees of EVERY leg, plus the realized funding of every leg. This
+    is deliberately stricter than the leg's own net: a take profit on one leg
+    closes both, so the winning leg has to pay for the whole round trip."""
+    leg = legs[leg_name]
+    gross = gross_pnl(leg.side, leg.entry_price, marks[leg_name], leg.qty)
+    open_fees = sum(l.open_fee for l in legs.values())
+    close_fees = sum(estimate_close_fee(l, marks[name], schedule) for name, l in legs.items())
+    funding = sum(l.funding for l in legs.values())
+    net = gross - open_fees - close_fees + funding
+    notional = leg.notional
+    return TwoLegNet(
+        leg=leg_name,
+        gross_pnl=gross,
+        open_fees=open_fees,
+        close_fees_est=close_fees,
+        funding=funding,
+        net_pnl=net,
+        notional=notional,
+        net_pct=(net / notional * 100.0) if notional > 0 else 0.0,
     )
 
 
-def compute_breakeven_prices(
-    entries: Sequence[EntryFill],
-    fee_engine: FeeEngine,
-) -> Tuple[float, float]:
-    """Returns (breakeven_gross_price, breakeven_net_price) for a SHORT position.
-
-    breakeven_gross is simply the volume-weighted average entry price.
-
-    breakeven_net solves net_pnl(price) == 0 for `price`, where the estimated
-    close fee is itself a function of the close price:
-
-        (avg_entry - price) * qty - open_fees - taker_rate * price * qty + funding_cf = 0
-        => price = (avg_entry * qty - open_fees + funding_cf) / (qty * (1 + taker_rate))
-    """
-    total_qty = sum(e.qty for e in entries)
-    if total_qty <= 0:
-        return 0.0, 0.0
-
-    be_gross = sum(e.price * e.qty for e in entries) / total_qty
-    total_open_fees = sum(e.taker_fee_usdt for e in entries)
-    funding_cf = fee_engine.total_funding_cashflow()
-    taker_rate = fee_engine.schedule.taker_rate
-
-    be_net = (be_gross * total_qty - total_open_fees + funding_cf) / (total_qty * (1.0 + taker_rate))
-    return be_gross, be_net
+def realized_leg_net(leg: LegPosition, exit_price: float, close_fee: float) -> float:
+    """Realized net of a single closed leg, in its own settlement coin: what
+    that coin's balance actually gained or lost on this cycle."""
+    return gross_pnl(leg.side, leg.entry_price, exit_price, leg.qty) - leg.open_fee - close_fee + leg.funding
