@@ -1,164 +1,102 @@
-# Documentazione tecnica — BTC bot v2.0 (hedge a due gambe, Bybit V5)
+# Documentazione tecnica — TRX bot v3.0 (accumulo one-way, Bybit V5)
 
-BTC bot apre insieme **due posizioni perpetual opposte** su Bitcoin:
-
-| Gamba | Simbolo (CCXT) | Lato | Moneta di regolamento | Coppia spot per comprare BTC |
-|---|---|---|---|---|
-| `short` | `BTC/USDT:USDT` | SHORT | USDT | `BTC/USDT` |
-| `long` | `BTC/USDC:USDC` | LONG | USDC | `BTC/USDC` |
-
-Leva **125x** su entrambe (massimo consentito su BTCPERP-USDC; BTCUSDT arriva a 150x), margine cross.
+TRX bot opera su **un solo perpetual**, **TRX/USDC** (Bybit `TRXPERP`, regolato in USDC), leva **75x** (massimo consentito), margine cross, **modalità one-way** (una sola posizione netta).
 Lavora su **Bybit Demo Trading** (`USE_TESTNET=true` in `.env`, default).
 
-> Nota: con importi uguali il primo ciclo chiude sempre in perdita (le due gambe si compensano, restano le fee), quindi il secondo giro è sempre moltiplicato.
-
-> Il progetto deriva dal grid bot ETH (tag git `pre-btc-bot-v2` = stato di partenza) ma è un progetto separato:
-> repository GitHub `proy84/BTC-bot` (remote git `btcbot`), branch `btc-bot-v2`.
+> Repository GitHub `proy84/BTC-bot` (remote git `btcbot`), branch **`trx-bot`**.
+> La strategia precedente (hedge BTC a due gambe) è archiviata nel tag `btc-hedge-final` (branch `btc-bot-v2`).
 > Il remote `origin` (eth_grid_bot) ha il push disattivato.
 
 ---
 
-## 1. Struttura del progetto
+## 1. Strategia
+
+1. **Avvio**: apre subito uno **SHORT** a mercato di importo = `equity_based_sizing.percentage`% dell'equity totale (default 1%). L'importo è calcolato al **primo avvio** e poi resta **fisso** (salvato nello stato); mai sotto il minimo exchange (5 USDC).
+2. **Ogni minuto** (timeframe `1m`, 1 s dopo lo scoccare del minuto) spara **un ordine a mercato dello stesso importo** nella **direzione attiva**.
+3. **Posizione netta one-way**: gli ordini nella direzione opposta alla posizione la **riducono** (realizzando il PnL della parte ridotta); se la superano la posizione **cambia segno**.
+4. **Inversione** (`reversal_pct`, default 0,5%): quando la posizione netta è in profitto oltre lo 0,5% rispetto al suo **breakeven netto**:
+   - posizione **SHORT** e prezzo ≤ BE × (1 − 0,5%) → direzione attiva **LONG**;
+   - posizione **LONG** e prezzo ≥ BE × (1 + 0,5%) → direzione attiva **SHORT**.
+   L'ordine del minuto in corso parte già nella nuova direzione.
+5. **Nessun take profit e nessun limite** per ora: ordini all'infinito (regola del TP da definire).
+
+### Breakeven netto (`strategy.breakeven_net`)
+Prezzo al quale chiudendo **tutta** la posizione a mercato l'episodio corrente finisce a **zero netto**: include il PnL già realizzato con le riduzioni, **tutte le fee pagate**, il **funding** e la **fee di chiusura stimata** (taker).
+
+```
+SHORT:  p = (R + A·Q) / (Q·(1 + f))
+LONG:   p = (A·Q − R) / (Q·(1 − f))
+R = realizzato lordo − fee + funding dell'episodio,  A = prezzo medio,  Q = quantità,  f = taker rate
+```
+
+**Episodio**: dall'apertura da flat fino al ritorno a flat (o al cambio di segno, che chiude l'episodio e ne apre uno nuovo dall'altro lato con la quantità in eccesso; la fee di quell'ordine è ripartita pro-quota). Il netto di ogni episodio chiuso è registrato nello storico.
+
+---
+
+## 2. Struttura del progetto
 
 | File | Ruolo |
 |---|---|
-| `main.py` | Orchestratore `BtcBot`: ciclo di tick, apertura gambe, TP, CLOSE ALL, regolamento, riapertura, stato persistente. |
-| `strategy.py` | Config (`StrategyConfig`) e **logica pura** senza rete: TP netto su due gambe, moltiplicatori cumulativi, decisione dopo la chiusura, sizing, piano di regolamento spot. |
-| `fees.py` | Matematica pura: PnL long/short, fee, netto di una gamba con i costi di entrambe (`two_leg_net`), netto realizzato per gamba. |
-| `exchange.py` | Gateway CCXT a Bybit V5: due istanze (pubblica produzione per i prezzi, privata Demo per ordini/conto), ordini perpetual e spot con dedup per `clientOrderId`, funding realizzato, saldi/debiti per moneta. |
-| `analytics.py` | Storico dei cicli chiusi (`btc_bot_history.json`) e statistiche. |
-| `data_exporter.py` | Snapshot live per dashboard (`btc_bot_live.json`). |
-| `notifier.py` | Notifiche Telegram opzionali e isolate (avvio, ciclo chiuso, stop). |
-| `config.json` | Parametri della strategia (nessun segreto). |
-| `.env` | **Solo locale, mai committato**: `BYBIT_API_KEY`, `BYBIT_API_SECRET`, `USE_TESTNET`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`. Modello: `.env.example`. |
-| `tests/` | Test pytest (TP netto, moltiplicatori, decisione, flusso completo con exchange finto). |
-| `tools/demo_spot_repay_test.py` | Prova manuale su Demo: verifica che un accredito spot azzeri un debito USDC. |
+| `main.py` | Orchestratore `TrxBot`: tick ogni 2 s, riconciliazione con Bybit, funding, inversione, un ordine per minuto, stato persistente, notifiche. |
+| `strategy.py` | Config (`StrategyConfig`) e logica pura: `PositionBook` (netting one-way), `breakeven_net`, `reversal_signal`, sizing, arrotondamento qty, `BotState`. |
+| `fees.py` | Primitive: `FeeSchedule`, `gross_pnl` long/short. |
+| `exchange.py` | Gateway CCXT a Bybit V5: istanza pubblica (prezzi, metadati) + privata Demo (ordini, posizione, saldo, funding). Dedup ordini per `clientOrderId`. |
+| `analytics.py` | Storico `trx_bot_history.json`: ordini, inversioni, episodi chiusi, riepilogo. |
+| `data_exporter.py` | Snapshot live `trx_bot_live.json` (direzione, posizione, BE netto, prezzo di inversione). |
+| `notifier.py` | Telegram opzionale e isolato: avvio, inversioni, episodi chiusi, riallineamenti. |
+| `config.json` | Parametri (nessun segreto). |
+| `.env` | **Solo locale**: `BYBIT_API_KEY`, `BYBIT_API_SECRET`, `USE_TESTNET`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`. Modello: `.env.example`. |
+| `tests/` | Test pytest. |
 
-File di runtime (ignorati da git): `btc_bot_state.json`, `btc_bot_history.json`, `btc_bot_live.json`, `STOP`.
+File di runtime (ignorati da git): `trx_bot_state.json`, `trx_bot_history.json`, `trx_bot_live.json`, `STOP`, `bot.log`.
 
-Avvio: `python main.py` · Test: `python -m pytest` · Log dettagliati: `LOG_LEVEL=DEBUG python main.py` · Arresto pulito: creare un file `STOP` nella cartella (le posizioni restano aperte, lo stato è salvato).
-
----
-
-## 2. Vocabolario
-
-- **Ciclo**: le due gambe aperte → una gamba fa TP → **CLOSE ALL** (chiusura di entrambe).
-- **Sequenza**: i cicli dall'ultimo reset al base notional fino al ciclo che chiude la sequenza in guadagno netto.
-  Per ogni sequenza si accumula il **netto realizzato per moneta**: USDT (gamba short) e USDC (gamba long).
-- **Passo** (`step`): quante riaperture con moltiplicatori sono state fatte nella sequenza (0 = base).
+Avvio: `python main.py` · Test: `python -m pytest` · Log dettagliati: `LOG_LEVEL=DEBUG python main.py` · Arresto pulito: creare un file `STOP` nella cartella (la posizione resta aperta, lo stato è salvato).
 
 ---
 
-## 3. Strategia
+## 3. Dettagli di funzionamento
 
-### 3.1 Apertura
-All'avvio (e subito dopo ogni CLOSE ALL) apre a mercato `short` e `long` al **notional target** della sequenza.
-- **Base notional** (per gamba, uguale sulle due) = `equity_based_sizing.percentage`% dell'equity totale reale (`totalEquity` Bybit, tutte le monete di collaterale), alzato al minimo exchange (`0.001 BTC × prezzo`, oggi ~84 $). Con ~3.330 $ di equity l'1% (33 $) è sotto il minimo: la base diventa 0,001 BTC.
-- Quantità = `qty_for_notional`: notional/prezzo arrotondato al passo exchange **al più vicino** (0,0015 → 0,002), mai sotto il minimo. I moltiplicatori si applicano al **notional target**, mai alla quantità arrotondata, quindi la sequenza resta esatta.
-- Una gamba che non si apre viene ritentata dopo 30 s; il TP si valuta solo con entrambe aperte.
-
-### 3.2 Take profit netto su due gambe (punto chiave)
-Per ciascuna gamba `X`, a ogni tick (`fees.two_leg_net`, `strategy.check_take_profit`):
-
-```
-netto_X = PnL_lordo_X
-        − fee apertura (short + long)
-        − fee chiusura stimate ai prezzi correnti (short + long)
-        + funding realizzato (short + long)
-
-TP su X  ⇔  netto_X ≥ take_profit_net_pct% × notional_X      (attuale 0,20%)
-```
-
-La gamba che fa TP paga **l'intero giro** di entrambe le posizioni, non solo le proprie fee. USDT e USDC sono sommati 1:1.
-Esempio (entrambe 0,001 BTC a 100.000, taker 0,055%): la short fa TP solo con prezzo ≤ 99.580,46; a 99.650 con le sole proprie fee sarebbe già a +0,24%, ma con i costi di entrambe no (test `test_own_fees_only_would_trigger_but_two_leg_net_does_not`).
-Fee reali: quelle riportate da Bybit nel fill; se assenti, stima `taker_rate × notional`.
-
-### 3.3 CLOSE ALL e netto del ciclo
-Al TP il bot chiude **entrambe** le gambe a mercato (`reduceOnly`). Se una chiusura fallisce, viene ritentata al tick successivo; il regolamento parte solo quando entrambe sono chiuse.
-Netto realizzato per gamba = lordo − fee apertura − fee chiusura reale + funding, nella propria moneta. Si somma al netto della sequenza.
-
-### 3.4 Decisione dopo il CLOSE ALL (`strategy.decide_after_close`)
-- **a) Ripaga + margine per BTC** → `new_sequence`: la moneta con il netto di sequenza maggiore (vincente) deve riuscire a **ripagare tutta la perdita dell'altra** (conversione spot, alzata al minimo di 5,10 se più piccola) **e** avere ancora **almeno il minimo ordine spot (5)** per comprare BTC. Solo allora: repay, acquisto BTC spot col resto, nuova sequenza al base notional (ricalcolato dall'equity), senza moltiplicatori. Un netto di sequenza positivo ma insufficiente (es. USDT +7 / USDC −2,5 → dopo il repay restano 1,9) **non** basta: si continua con i moltiplicatori.
-- **b) Altrimenti** → `multiply`: moltiplicatori **cumulativi** per gamba — gamba che ha fatto TP = suo importo precedente × `multipliers.winner` (2,0), l'altra = suo importo precedente × `multipliers.loser` (1,5). Sempre.
-- **Tetto** `max_multiplier_steps`: `null` = nessun limite (default, fase di stress test). Se impostato a N e la riapertura supererebbe N passi → `stop`: posizioni chiuse, nessuna riapertura, notifica, il bot si ferma.
-
-Sequenza di riferimento (base 100, test `test_reference_sequence`):
-`100S/100L → TP long → 150S/200L → TP short → 300S/300L → TP long → 450S/600L → TP short → 900S/900L → TP short → 1800S/1350L → TP short con guadagno netto → repay + acquisto BTC spot → 100S/100L`.
-
-### 3.5 Repay e acquisto BTC spot (`strategy.plan_spot_settlement`, `BtcBot._spot_settlement`)
-**Bybit Demo non supporta il repay**: verificato il 2026-09-28 sul conto Demo,
-`/v5/account/repay` e `/v5/account/no-convert-repay` → `retCode 10032 "Demo trading are not supported"`,
-`/v5/account/quick-repayment` → `10016`. Coerente con l'elenco ufficiale degli endpoint Demo.
-
-Soluzione adottata (**repay tramite spot**): la moneta vincente **accredita** la moneta perdente con un ordine spot su `settlement.stable_conversion_symbol` (`USDC/USDT`, supportato su Demo). Nel conto Unified un accredito su una moneta con saldo negativo compensa il debito (da confermare con `tools/demo_spot_repay_test.py`).
-- vincente USDT, perdente USDC → market **buy** `USDC/USDT` spendendo `importo` USDT;
-- vincente USDC, perdente USDT → market **sell** `importo` USDC su `USDC/USDT`.
-- Dopo la conversione il bot rilegge il debito: se resta, in **produzione** chiama `/v5/account/repay`; su Demo lo segnala nel log/notifica.
-- Col resto: market buy BTC spot sulla coppia della moneta vincente (`BTC/USDT` o `BTC/USDC`).
-- Minimo ordine spot Bybit = **5** (USDT/USDC): un repay più piccolo viene alzato a 5,10 (l'eccesso resta sul saldo della moneta perdente); un acquisto BTC sotto 5 viene saltato (il resto resta nella moneta vincente); se il profitto vincente è sotto il minimo, non si fa nessun ordine spot. Non si spende mai più del profitto della moneta vincente.
-- Ogni operazione spot è best-effort: un errore viene registrato ma non blocca il ciclo successivo.
-
-### 3.6 Funding
-Funding **realizzato** letto per simbolo dal registro di Bybit (`fetch_funding_history` → `/v5/execution/list`, supportato su Demo), ogni `funding_poll_interval_sec`, deduplicato per id di settlement, con finestra temporale che avanza. Entra nel TP (entrambe le gambe) e nel netto realizzato.
+- **Riconciliazione a ogni tick**: la posizione netta reale su Bybit (lato e quantità) è la fonte di verità. Se non coincide con quella del bot (es. **chiusura manuale** da app), il bot lo segnala nel log/Telegram e si **riallinea** (nuovo episodio; prezzo medio preso da Bybit, fee di apertura stimate). Il prezzo medio del bot viene invece dai **propri fill**, perché sui perpetual USDC il settlement di sessione (ogni 8 h) può riscrivere l'`entryPrice` di Bybit.
+- **Un tentativo per minuto**: se un ordine fallisce (es. margine insufficiente) viene loggato e si riprova al minuto successivo, senza raffiche.
+- **Fee reali**: quelle riportate da Bybit nel fill; se assenti, stima `taker_rate × notional`.
+- **Funding realizzato**: letto dal registro Bybit (`/v5/execution/list`, supportato su Demo) ogni `funding_poll_interval_sec`, deduplicato per id, sommato all'episodio corrente. **Segno**: Bybit/ccxt lo riportano come *fee* (positivo = pagato); il bot lo converte in cashflow (positivo = incassato) — verificato su Demo il 29/09/2026 (test `test_funding_sign.py`).
+- **Riavvio**: `trx_bot_state.json` conserva direzione attiva, importo per ordine, posizione/episodio e ultimo minuto servito: nessun ordine extra al riavvio.
+- **Due istanze CCXT**: `_public` (produzione, non autenticata) e `_private` (host `https://api-demo.bybit.com` con `USE_TESTNET=true`); il catalogo mercati del privato è copiato dal pubblico (`load_markets()` sul Demo fallisce con 10032).
+- **Dedup ordini**: su errore di rete il bot verifica su Bybit se l'ordine col proprio `clientOrderId` esiste prima di reinviarlo.
 
 ---
 
-## 4. Stato persistente e riavvio
-`btc_bot_state.json` (`SequenceState`): `sequence_id`, `step`, `base_notional`, `notionals` per gamba, `net_by_coin` della sequenza, `cycle_id`. Salvato dopo ogni regolamento.
-Al riavvio:
-- stato presente → si riprende la sequenza al passo salvato;
-- posizioni aperte sui due simboli → riconciliate come gambe correnti (fee di apertura stimata); una gamba mancante viene aperta al target;
-- posizione con il **lato sbagliato** su un simbolo (es. LONG su BTC/USDT) → il bot **non parte** e chiede di chiuderla a mano.
-
----
-
-## 5. Esecuzione ordini e API
-- Due istanze CCXT: `_public` (produzione, non autenticata: prezzi, metadati mercati) e `_private` (autenticata, host `https://api-demo.bybit.com` con `USE_TESTNET=true`). Il catalogo mercati del client privato è copiato dal pubblico (`load_markets()` sul Demo fallisce con 10032).
-- Ogni ordine passa da `_create_order_with_dedup`: un `clientOrderId` per ordine logico; su errore di rete **prima verifica** su Bybit se l'ordine esiste, poi eventualmente reinvia. Fill letti con `fetch_order` (prezzo medio, quantità, fee).
-- `_retry`: backoff esponenziale sugli errori di rete; i rifiuti dell'exchange non vengono ritentati.
-- Tutte le modifiche di posizione avvengono sotto `_position_lock`.
-
----
-
-## 6. Configurazione (`config.json`)
+## 4. Configurazione (`config.json`)
 
 | Campo | Default | Significato |
 |---|---|---|
-| `legs.short/long` | vedi tabella iniziale | simbolo, lato, moneta di regolamento, coppia spot BTC |
-| `leverage` | 125 | leva su entrambe le gambe |
+| `symbol` | `TRX/USDC:USDC` | perpetual TRXPERP |
+| `leverage` | 75 | leva (massimo Bybit su TRXPERP) |
 | `margin_mode` | `cross` | |
-| `take_profit_net_pct` | 0.20 | soglia TP netto su due gambe, % del notional della gamba |
+| `timeframe` | `1m` | un ordine per timeframe |
+| `initial_direction` | `short` | direzione del primo ordine |
+| `reversal_pct` | 0.5 | % oltre il breakeven netto che fa invertire la direzione |
 | `fees.taker_rate` / `maker_rate` | 0.00055 / 0.0002 | per stime (le fee reali vengono dai fill) |
-| `equity_based_sizing.enabled` / `percentage` | true / 1.0 | base notional = % dell'equity totale |
-| `base_notional_usd` | 1.0 | ripiego se la lettura equity fallisce |
-| `multipliers.winner` / `loser` | 2.0 / 1.5 | moltiplicatori cumulativi |
-| `max_multiplier_steps` | null | null = nessun limite; N = stop dopo N passi |
-| `settlement.enabled` | true | repay via spot + acquisto BTC dopo una sequenza vincente |
-| `settlement.stable_conversion_symbol` | `USDC/USDT` | coppia di conversione tra le due stable |
-| `settlement.spot_min_order_value` | 5.0 | minimo ordine spot Bybit |
+| `equity_based_sizing.enabled` / `percentage` | true / 1.0 | importo per ordine = % dell'equity al primo avvio |
+| `base_notional_usd` | 5.0 | ripiego se la lettura equity fallisce |
 | `notifier.enabled` | true | Telegram (richiede le variabili in `.env`) |
 | `polling.tick_poll_interval_sec` | 2 | frequenza del tick |
 | `polling.funding_poll_interval_sec` | 300 | frequenza lettura funding |
-| `paths.*` | `btc_bot_*.json` | storico, snapshot live, stato persistente |
+| `paths.*` | `trx_bot_*.json` | storico, snapshot live, stato persistente |
+
+Limiti Bybit su TRXPERP (verificati 29/09/2026): leva max 75x, qty minima 1 TRX, passo 1 TRX, ordine minimo 5 USDC.
 
 ---
 
-## 7. Cosa è stato eliminato rispetto al grid bot ETH
-RangeGrid, grid step e step table, grid reindex, range offsets, tick mode e RSI, Neutral Zone, stress test, trailing stop, sizing Fibonacci e `level_multiplier`, auto_compound, logica "only short", finestra ONE_ORDER, `eth_spot_accumulator.py`, `state.json`, lettura di `SYMBOL`/`GRID_STEP_PERCENT` da `.env`, e tutte le relative voci di config.
-Mantenuti e adattati: retry con dedup per `clientOrderId`, lock delle posizioni, funding realizzato, equity reale, analytics, notifier Telegram, log ridotti (INFO solo per aperture, TP, chiusure, decisioni, riepilogo ogni 5 minuti).
+## 5. Test
+`python -m pytest`:
+- `tests/test_position_book.py`: accumulo e prezzo medio, riduzione con PnL realizzato, chiusura esatta, cambio di segno con fee pro-quota.
+- `tests/test_breakeven_reversal.py`: breakeven netto che azzera l'episodio (fee, funding, parte realizzata), soglie di inversione esatte short→long e long→short, nessuna inversione in perdita, arrotondamento qty TRX, slot del timeframe.
+- `tests/test_bot_flow.py`: orchestratore con exchange finto e orologio simulato — primo ordine all'avvio, un ordine al minuto, inversione, cambio di segno e chiusura episodio, ritorno a short, riallineamento dopo chiusura manuale, ripresa dopo riavvio.
+- `tests/test_funding_sign.py`: conversione del segno del funding con i valori reali Demo.
 
 ---
 
-## 8. Test
-`python -m pytest` — 39 test:
-- `tests/test_take_profit_net.py`: soglie esatte TP short/long, fee di entrambe le gambe, funding di entrambe, notional diversi per gamba.
-- `tests/test_multipliers.py`: sequenza di riferimento, cumulatività, parametri, arrotondamento quantità.
-- `tests/test_cycle_decision.py`: nuova sequenza vs moltiplicatori, zero non è guadagno, `max_multiplier_steps`, sequenza completa fino al reset, piano spot con minimi.
-- `tests/test_bot_flow.py`: orchestratore con exchange finto (apertura → TP → CLOSE ALL → moltiplicatori → nuova sequenza), regolamento spot nei due versi, ripresa dopo riavvio, rifiuto posizione di lato sbagliato.
-
----
-
-## 9. Punti aperti / da verificare su Demo
-1. Lanciare `python tools/demo_spot_repay_test.py` per confermare che l'accredito spot azzeri il debito USDC (esiste già un debito USDC di ~0,017 sul conto Demo).
-2. Primo avvio reale su Demo: verificare leva 125x su entrambi i simboli, fee riportate nei fill, funding USDC letto correttamente.
-3. Rischio intrinseco della strategia: i moltiplicatori cumulativi crescono in modo geometrico (×2 / ×1,5 per passo) e senza `max_multiplier_steps` non c'è limite all'esposizione.
+## 6. Punti aperti
+1. **Regola del take profit**: da definire.
+2. **Nessun limite di esposizione**: la posizione cresce di un ordine al minuto finché il prezzo non va in profitto oltre lo 0,5%; con prezzo contro, margine e rischio crescono senza tetto. Da decidere un limite (qty massima, margine massimo o stop).

@@ -1,5 +1,5 @@
 {
-  "_comment": "BTC bot v2 -- hedge a due gambe: BTC/USDT SHORT + BTC/USDC LONG, aperte insieme. Chiavi API, USE_TESTNET e Telegram stanno SOLO in .env (vedi .env.example), mai qui.",
+  "_comment": "TRX bot v3 -- accumulo one-way su TRX/USDC perpetual (Bybit TRXPERP). Chiavi API, USE_TESTNET e Telegram stanno SOLO in .env (vedi .env.example), mai qui.",
 
   "exchange": {
     "id": "bybit",
@@ -10,52 +10,28 @@
     }
   },
 
-  "_comment_legs": "Le due gambe. settle_coin = moneta di regolamento del perpetual; spot_btc_symbol = coppia spot usata per comprare BTC con quella moneta dopo una sequenza vincente.",
-  "legs": {
-    "short": {
-      "symbol": "BTC/USDT:USDT",
-      "side": "short",
-      "settle_coin": "USDT",
-      "spot_btc_symbol": "BTC/USDT"
-    },
-    "long": {
-      "symbol": "BTC/USDC:USDC",
-      "side": "long",
-      "settle_coin": "USDC",
-      "spot_btc_symbol": "BTC/USDC"
-    }
-  },
-  "leverage": 125,
+  "symbol": "TRX/USDC:USDC",
+  "leverage": 75,
   "margin_mode": "cross",
 
-  "_comment_take_profit": "Una gamba fa TP quando il suo PnL lordo, meno le fee (apertura + chiusura stimata) di ENTRAMBE le gambe, piu' il funding realizzato di ENTRAMBE, e' >= take_profit_net_pct% del notional della gamba stessa. Al TP: CLOSE ALL.",
-  "take_profit_net_pct": 0.20,
+  "_comment_timeframe": "Ogni timeframe (1 minuto) il bot spara UN ordine a mercato di importo fisso nella direzione attiva. All'avvio il primo ordine parte subito.",
+  "timeframe": "1m",
+  "initial_direction": "short",
+
+  "_comment_reversal": "Modalita' one-way: una sola posizione netta. Quando la posizione netta e' reversal_pct% in profitto oltre il suo breakeven NETTO (prezzo medio + fee pagate + funding + fee di chiusura stimata), la direzione attiva si inverte: short in profitto -> si sparano long (che riducono lo short e poi lo girano), long in profitto -> si sparano short. Nessun TP e nessun limite per ora.",
+  "reversal_pct": 0.5,
 
   "fees": {
     "taker_rate": 0.00055,
     "maker_rate": 0.0002
   },
 
-  "_comment_sizing": "Base notional di ciascuna gamba = percentage% dell'equity totale reale (totalEquity Bybit, tutte le monete), alzata al minimo exchange (0.001 BTC). base_notional_usd e' usato solo se la lettura dell'equity fallisce.",
+  "_comment_sizing": "Importo di ogni ordine = percentage% dell'equity totale reale (totalEquity Bybit), letto al PRIMO avvio e poi fisso (salvato nello stato). Mai sotto il minimo exchange (5 USDC). base_notional_usd e' usato solo se la lettura dell'equity fallisce.",
   "equity_based_sizing": {
     "enabled": true,
     "percentage": 1.0
   },
-  "base_notional_usd": 1.0,
-
-  "_comment_multipliers": "Se dopo il CLOSE ALL la moneta vincente NON riesce a ripagare la perdita dell'altra lasciando almeno settlement.spot_min_order_value (5) per comprare BTC spot: riapre con moltiplicatori CUMULATIVI per gamba -- gamba che ha fatto TP = importo precedente x winner, l'altra = importo precedente x loser. max_multiplier_steps: null = nessun limite; un intero N = dopo N riaperture moltiplicate il bot chiude tutto e si ferma.",
-  "multipliers": {
-    "winner": 2.0,
-    "loser": 1.5
-  },
-  "max_multiplier_steps": null,
-
-  "_comment_settlement": "Nuova sequenza solo se la moneta vincente ripaga l'altra E le restano almeno spot_min_order_value per il BTC: la moneta vincente copre la perdita dell'altra con una conversione SPOT su stable_conversion_symbol (su Bybit Demo /v5/account/repay non e' supportato), poi col resto compra BTC spot. Ordini spot sotto spot_min_order_value (minimo Bybit 5) vengono alzati al minimo (repay) o saltati (acquisto BTC). enabled=false: nessuna operazione spot, solo reset a base.",
-  "settlement": {
-    "enabled": true,
-    "stable_conversion_symbol": "USDC/USDT",
-    "spot_min_order_value": 5.0
-  },
+  "base_notional_usd": 5.0,
 
   "notifier": {
     "enabled": true
@@ -67,8 +43,8 @@
   },
 
   "paths": {
-    "trade_history_path": "btc_bot_history.json",
-    "state_export_path": "btc_bot_live.json",
-    "runtime_state_path": "btc_bot_state.json"
+    "trade_history_path": "trx_bot_history.json",
+    "state_export_path": "trx_bot_live.json",
+    "runtime_state_path": "trx_bot_state.json"
   }
 }

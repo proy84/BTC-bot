@@ -10,3 +10,6 @@ __pycache__/
 /btc_bot_state.json
 /btc_bot_live.json
 /btc_bot_history.json
+/trx_bot_state.json
+/trx_bot_live.json
+/trx_bot_history.json
