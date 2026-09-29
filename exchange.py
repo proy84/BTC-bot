@@ -1,9 +1,8 @@
 """
 exchange.py
 
-CCXT gateway to Bybit V5 for BTC bot: two linear perpetuals (BTC/USDT SHORT,
-BTC/USDC LONG) plus the spot pairs used after a winning sequence (USDC/USDT
-conversion, BTC/USDT or BTC/USDC purchase).
+CCXT gateway to Bybit V5 for TRX bot: one linear perpetual (TRX/USDC =
+Bybit TRXPERP, settles in USDC), ONE-WAY position mode.
 
 IMPORTANT (discovered empirically): Bybit's Demo Trading host
 (`https://api-demo.bybit.com`) only supports a narrow set of AUTHENTICATED
@@ -11,9 +10,6 @@ endpoints (order/position/wallet management, see
 https://bybit-exchange.github.io/docs/v5/demo). Anything else -- including the
 currency-metadata lookup CCXT's `load_markets()` triggers once an API key is
 present -- is rejected with `retCode 10032 "Demo trading are not supported"`.
-Also confirmed on Demo: /v5/account/repay and /v5/account/no-convert-repay
-return 10032, which is why BTC bot repays a coin's borrow by crediting it with
-a spot order instead (see `strategy.plan_spot_settlement`).
 
 Hence two CCXT instances:
   - `self._public`  -- unauthenticated, production public host: market data
@@ -37,14 +33,14 @@ import os
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import ccxt.async_support as ccxt_async  # type: ignore[import-untyped]
 from ccxt.base.errors import ExchangeError, NetworkError  # type: ignore[import-untyped]
 
 from strategy import BOT_NAME, StrategyConfig
 
-logger = logging.getLogger("btc_bot.exchange")
+logger = logging.getLogger("trx_bot.exchange")
 
 BYBIT_DEMO_BASE_URL = "https://api-demo.bybit.com"
 
@@ -52,7 +48,6 @@ BYBIT_DEMO_BASE_URL = "https://api-demo.bybit.com"
 @dataclass(frozen=True)
 class FilledOrder:
     order_id: str
-    symbol: str
     side: str  # "buy" | "sell"
     price: float
     qty: float
@@ -63,11 +58,9 @@ class FilledOrder:
 
 @dataclass(frozen=True)
 class OpenPosition:
-    symbol: str
     side: str  # "long" | "short"
     qty: float
     entry_price: float
-    mark_price: float
     unrealized_pnl: float
 
 
@@ -80,13 +73,13 @@ class CoinBalance:
 
 
 class ExchangeClient:
-    """Async CCXT wrapper around Bybit V5 (demo trading by default)."""
+    """Async CCXT wrapper around Bybit V5 (demo trading by default), one symbol."""
 
     def __init__(self, cfg: StrategyConfig, max_retries: int = 5, retry_base_delay_sec: float = 1.0):
         self.cfg = cfg
+        self.symbol = cfg.symbol
         self.max_retries = max_retries
         self.retry_base_delay_sec = retry_base_delay_sec
-        self.perp_symbols = [leg.symbol for leg in cfg.legs.values()]
 
         api_key, api_secret = self._resolve_credentials(cfg)
 
@@ -114,8 +107,7 @@ class ExchangeClient:
         })
 
         if cfg.use_testnet:
-            logger.info("%s exchange: mode=DEMO (%s) apiKey=%s...", BOT_NAME, BYBIT_DEMO_BASE_URL,
-                        api_key[:4])
+            logger.info("%s exchange: mode=DEMO (%s) apiKey=%s...", BOT_NAME, BYBIT_DEMO_BASE_URL, api_key[:4])
         else:
             logger.warning("%s exchange: mode=PRODUCTION (LIVE FUNDS) apiKey=%s...", BOT_NAME, api_key[:4])
 
@@ -137,20 +129,20 @@ class ExchangeClient:
         self._private.set_markets(markets)
         await self._retry(self._private.load_time_difference)
 
-        for symbol in self.perp_symbols:
+        # ONE-WAY mode (hedge=False): a single net position, opposite orders reduce it.
+        for name, call in (
+            ("set_position_mode(one-way)", lambda: self._private.set_position_mode(False, self.symbol)),
+            (f"set_margin_mode({self.cfg.margin_mode})",
+             lambda: self._private.set_margin_mode(self.cfg.margin_mode, self.symbol)),
+            (f"set_leverage({self.cfg.leverage}x)", lambda: self._private.set_leverage(self.cfg.leverage, self.symbol)),
+        ):
             try:
-                await self._retry(self._private.set_margin_mode, self.cfg.margin_mode, symbol,
-                                  quiet_exchange_errors=True)
+                await self._retry(call, quiet_exchange_errors=True)
             except ExchangeError as exc:
-                logger.debug("set_margin_mode(%s, %s): %s (likely already set)", self.cfg.margin_mode, symbol, exc)
-            try:
-                await self._retry(self._private.set_leverage, self.cfg.leverage, symbol,
-                                  quiet_exchange_errors=True)
-            except ExchangeError as exc:
-                logger.debug("set_leverage(%dx, %s): %s (likely already set)", self.cfg.leverage, symbol, exc)
+                logger.debug("%s on %s: %s (likely already set)", name, self.symbol, exc)
 
-        logger.info("Exchange pronto: %s leva=%dx margine=%s", ", ".join(self.perp_symbols),
-                    self.cfg.leverage, self.cfg.margin_mode)
+        logger.info("Exchange pronto: %s one-way, leva=%dx, margine=%s", self.symbol, self.cfg.leverage,
+                    self.cfg.margin_mode)
 
     async def close(self) -> None:
         await self._public.close()
@@ -158,31 +150,41 @@ class ExchangeClient:
 
     # -- market data / metadata ---------------------------------------------
 
-    async def fetch_last_price(self, symbol: str) -> float:
-        ticker = await self._retry(self._public.fetch_ticker, symbol)
+    async def fetch_last_price(self) -> float:
+        ticker = await self._retry(self._public.fetch_ticker, self.symbol)
         return float(ticker.get("last") or ticker.get("close"))
 
-    async def fetch_last_prices(self, symbols: Iterable[str]) -> Dict[str, float]:
-        symbols = list(symbols)
-        prices = await asyncio.gather(*(self.fetch_last_price(s) for s in symbols))
-        return dict(zip(symbols, prices))
-
-    def min_order_qty(self, symbol: str) -> float:
-        """Exchange minimum qty (e.g. 0.001 BTC). Never raises: 0.0 on lookup failure."""
+    def min_order_qty(self) -> float:
+        """Exchange minimum qty (1 TRX on TRXPERP). Never raises: 0.0 on lookup failure."""
         try:
-            market = self._public.market(symbol)
+            market = self._public.market(self.symbol)
             return float((market.get("limits") or {}).get("amount", {}).get("min") or 0.0)
         except Exception:
-            logger.exception("Failed to look up min order qty for %s", symbol)
+            logger.exception("Failed to look up min order qty for %s", self.symbol)
             return 0.0
 
-    def qty_step(self, symbol: str) -> float:
-        """Exchange qty increment (e.g. 0.001 BTC). 0.0 on lookup failure."""
+    def min_order_notional(self) -> float:
+        """Exchange minimum order value (5 USDC on TRXPERP). 0.0 on lookup failure."""
         try:
-            market = self._public.market(symbol)
+            market = self._public.market(self.symbol)
+            unified = (market.get("limits") or {}).get("cost", {}).get("min")
+            if unified:
+                return float(unified)
+            # ccxt leaves limits.cost.min empty for Bybit linear; the raw
+            # instrument info carries it as lotSizeFilter.minNotionalValue.
+            raw = ((market.get("info") or {}).get("lotSizeFilter") or {}).get("minNotionalValue")
+            return float(raw or 0.0)
+        except Exception:
+            logger.exception("Failed to look up min order value for %s", self.symbol)
+            return 0.0
+
+    def qty_step(self) -> float:
+        """Exchange qty increment (1 TRX on TRXPERP). 0.0 on lookup failure."""
+        try:
+            market = self._public.market(self.symbol)
             return float((market.get("precision") or {}).get("amount") or 0.0)
         except Exception:
-            logger.exception("Failed to look up qty step for %s", symbol)
+            logger.exception("Failed to look up qty step for %s", self.symbol)
             return 0.0
 
     # -- account -------------------------------------------------------------
@@ -193,7 +195,7 @@ class ExchangeClient:
 
     async def fetch_total_equity(self) -> float:
         """Unified Account total equity in USD across ALL collateral coins
-        (`totalEquity`) -- CCXT's `balance['USDT']` alone would massively
+        (`totalEquity`) -- CCXT's per-coin balance alone would massively
         understate it on an account holding BTC as collateral."""
         try:
             return float((await self._wallet_account())["totalEquity"])
@@ -213,19 +215,17 @@ class ExchangeClient:
             )
         return result
 
-    async def fetch_realized_funding(self, symbol: str, since_ms: Optional[int] = None,
+    async def fetch_realized_funding(self, symbol: Optional[str] = None, since_ms: Optional[int] = None,
                                      limit: int = 50) -> List[Tuple[str, int, float]]:
-        """REALIZED funding settlements for `symbol` from the exchange's own
-        ledger -- (id, timestamp_ms, cashflow in the settle coin, positive =
-        RECEIVED). Bybit settles every 8h; a short-lived position correctly
-        accrues ~0.
+        """REALIZED funding settlements from the exchange's own ledger --
+        (id, timestamp_ms, cashflow in the settle coin, positive = RECEIVED).
 
         Sign: ccxt's `amount` here is Bybit's `execFee` for the funding
         execution, i.e. a FEE -- positive when the position PAID funding.
-        Confirmed on Demo 2026-09-29 08:00 UTC (funding rate +0.0028%): the
-        SHORT reported execFee -0.0118 (received), the LONG +0.0675 (paid).
+        Confirmed on Demo 2026-09-29 08:00 UTC (funding rate +0.0028%): a
+        SHORT reported execFee -0.0118 (received), a LONG +0.0675 (paid).
         So the cashflow is `-amount`."""
-        raw = await self._retry(self._private.fetch_funding_history, symbol, since_ms, limit)
+        raw = await self._retry(self._private.fetch_funding_history, symbol or self.symbol, since_ms, limit)
         result: List[Tuple[str, int, float]] = []
         for entry in raw:
             eid, ts, amount = entry.get("id"), entry.get("timestamp"), entry.get("amount")
@@ -234,79 +234,34 @@ class ExchangeClient:
             result.append((str(eid), int(ts), -float(amount)))
         return result
 
-    # -- positions / perpetual orders ---------------------------------------
+    # -- position / orders ---------------------------------------------------
 
-    async def fetch_open_positions(self) -> Dict[str, OpenPosition]:
-        """Open positions on the bot's perpetual symbols, keyed by symbol. One
-        call per symbol: USDT and USDC perps settle in different coins and
-        Bybit's position list is queried per settle coin."""
-        result: Dict[str, OpenPosition] = {}
-        for symbol in self.perp_symbols:
-            raw = await self._retry(self._private.fetch_positions, [symbol])
-            for p in raw:
-                qty = float(p.get("contracts") or 0.0)
-                if qty <= 0 or p.get("symbol") != symbol:
-                    continue
-                result[symbol] = OpenPosition(
-                    symbol=symbol,
-                    side=str(p.get("side") or ""),
-                    qty=qty,
-                    entry_price=float(p.get("entryPrice") or 0.0),
-                    mark_price=float(p.get("markPrice") or 0.0),
-                    unrealized_pnl=float(p.get("unrealizedPnl") or 0.0),
-                )
-        return result
+    async def fetch_position(self) -> Optional[OpenPosition]:
+        """The net position on the symbol, or None if flat.
 
-    async def open_position_market(self, symbol: str, side: str, qty: float) -> FilledOrder:
-        """side: "long" | "short"."""
-        order_side = "buy" if side == "long" else "sell"
-        order = await self._create_order_and_await_fill(symbol, order_side, qty)
-        filled = self._to_filled_order(order, symbol, order_side)
-        logger.debug("Aperta %s %s: qty=%.6f prezzo=%.2f", side.upper(), symbol, filled.qty, filled.price)
-        return filled
+        NOTE: on USDC perpetuals Bybit's session settlement (every 8h) moves
+        realized PnL to the wallet and may rewrite `entryPrice`; the bot's own
+        average entry comes from its fills (`strategy.PositionBook`), this is
+        used to reconcile SIDE and QTY only."""
+        raw = await self._retry(self._private.fetch_positions, [self.symbol])
+        for p in raw:
+            qty = float(p.get("contracts") or 0.0)
+            if qty <= 0 or p.get("symbol") != self.symbol:
+                continue
+            return OpenPosition(
+                side=str(p.get("side") or ""),
+                qty=qty,
+                entry_price=float(p.get("entryPrice") or 0.0),
+                unrealized_pnl=float(p.get("unrealizedPnl") or 0.0),
+            )
+        return None
 
-    async def close_position_market(self, symbol: str) -> Optional[FilledOrder]:
-        """Closes the whole open position on `symbol` at market (reduceOnly).
-        Returns None if there is nothing open."""
-        position = (await self.fetch_open_positions()).get(symbol)
-        if position is None:
-            logger.warning("close_position_market: nessuna posizione aperta su %s.", symbol)
-            return None
-        order_side = "buy" if position.side == "short" else "sell"
-        order = await self._create_order_and_await_fill(symbol, order_side, position.qty,
-                                                        params={"reduceOnly": True})
-        filled = self._to_filled_order(order, symbol, order_side)
-        logger.debug("Chiusa %s %s: qty=%.6f prezzo=%.2f", position.side.upper(), symbol, filled.qty,
-                     filled.price)
-        return filled
-
-    # -- spot (post-sequence settlement) ------------------------------------
-
-    async def spot_market_buy_with_cost(self, symbol: str, cost: float) -> FilledOrder:
-        """Market BUY on a spot pair spending `cost` units of the QUOTE coin
-        (e.g. BTC/USDT with cost=10 spends 10 USDT)."""
-        order = await self._create_order_and_await_fill(symbol, "buy", cost, params={"cost": cost})
-        return self._to_filled_order(order, symbol, "buy")
-
-    async def spot_market_sell(self, symbol: str, qty: float) -> FilledOrder:
-        """Market SELL of `qty` units of the BASE coin (e.g. USDC/USDT qty=10 sells 10 USDC)."""
-        qty = float(self._public.amount_to_precision(symbol, qty))
-        order = await self._create_order_and_await_fill(symbol, "sell", qty)
-        return self._to_filled_order(order, symbol, "sell")
-
-    async def repay_via_endpoint(self, coin: str, amount: float) -> bool:
-        """/v5/account/repay -- PRODUCTION only (Demo answers retCode 10032).
-        Returns True if Bybit accepted the request. Never raises."""
-        if self.cfg.use_testnet:
-            return False
-        try:
-            resp = await self._retry(self._private.privatePostV5AccountRepay,
-                                     {"coin": coin, "amount": str(round(amount, 8))},
-                                     quiet_exchange_errors=True)
-            return str(resp.get("retCode", "0")) == "0"
-        except Exception:
-            logger.warning("Repay via /v5/account/repay fallito per %s %.6f", coin, amount, exc_info=True)
-            return False
+    async def place_market_order(self, side: str, qty: float) -> FilledOrder:
+        """side: "buy" | "sell". One-way mode: an order against the open
+        position reduces it (and flips it if larger)."""
+        qty = float(self._public.amount_to_precision(self.symbol, qty))
+        order = await self._create_order_and_await_fill(self.symbol, side, qty)
+        return self._to_filled_order(order, side)
 
     # -- internals -----------------------------------------------------------
 
@@ -400,13 +355,13 @@ class ExchangeClient:
                 return existing
 
     @staticmethod
-    def _to_filled_order(order: dict, symbol: str, side: str) -> FilledOrder:
+    def _to_filled_order(order: dict, side: str) -> FilledOrder:
         price = float(order.get("average") or order.get("price") or 0.0)
         qty = float(order.get("filled") or order.get("amount") or 0.0)
         ts = order.get("timestamp") or int(time.time() * 1000)
         fee_info = order.get("fee") or {}
         fee = fee_info.get("cost")
-        return FilledOrder(order_id=str(order.get("id", "")), symbol=symbol, side=side, price=price, qty=qty,
+        return FilledOrder(order_id=str(order.get("id", "")), side=side, price=price, qty=qty,
                            notional=price * qty, fee=float(fee) if fee is not None else None,
                            timestamp_ms=int(ts))
 
