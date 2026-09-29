@@ -1,9 +1,8 @@
 """
 notifier.py
 
-Optional, isolated Telegram notifications for BTC bot: one message per closed
-cycle (both legs, per-coin net, sequence state, decision taken, equity) and
-one-off alerts (e.g. startup, max_multiplier_steps reached).
+Optional, isolated Telegram notifications for TRX bot: startup, direction
+reversals and closed position episodes, each with account equity.
 
 FAIL-SAFE: every public coroutine runs its whole body under one try/except
 and only ever logs a WARNING -- it is scheduled by main.py as a background
@@ -23,7 +22,7 @@ from typing import Any, List, Optional
 
 from strategy import BOT_NAME
 
-logger = logging.getLogger("btc_bot.notifier")
+logger = logging.getLogger("trx_bot.notifier")
 
 _TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 EUR_RATE_SYMBOL = "USDT/EUR"  # Bybit spot pair, no external FX API
@@ -71,7 +70,7 @@ async def _equity_lines(exchange_client: Any) -> List[str]:
     lines.append(line)
     try:
         balances = await exchange_client.fetch_coin_balances()
-        for coin in ("USDT", "USDC", "BTC"):
+        for coin in ("USDC", "USDT", "BTC"):
             b = balances.get(coin)
             if b is None:
                 continue
@@ -97,22 +96,3 @@ async def notify_text(exchange_client: Any, enabled: bool, title: str, body: Lis
         await asyncio.to_thread(_send_sync, creds[0], creds[1], "\n".join(lines))
     except Exception:
         logger.warning("Notifica Telegram '%s' fallita, ignorata.", title, exc_info=True)
-
-
-async def notify_cycle_closed(exchange_client: Any, enabled: bool, record: Any) -> None:
-    """`record` is an analytics.CycleRecord."""
-    if not enabled:
-        return
-    try:
-        body = [f"TP gamba <b>{record.tp_leg.upper()}</b> — sequenza #{record.sequence_id}, passo {record.step}"]
-        for leg in record.legs:
-            body.append(f"  {leg.side.upper()} {leg.symbol} {leg.notional:.2f}: netto "
-                        f"{_signed(leg.net_pnl)} {leg.settle_coin}")
-        for coin, v in record.net_by_coin.items():
-            emoji = "\U0001F7E2" if v >= 0 else "\U0001F534"
-            body.append(f"{emoji} Ciclo {coin}: <b>{_signed(v)}</b> (sequenza {_signed(record.sequence_net_by_coin.get(coin, 0.0))})")
-        body.append(f"Decisione: <b>{record.decision}</b>")
-        body.extend(f"  • {a}" for a in record.spot_actions)
-        await notify_text(exchange_client, True, f"Ciclo #{record.cycle_id} chiuso", body)
-    except Exception:
-        logger.warning("Notifica ciclo fallita, ignorata.", exc_info=True)

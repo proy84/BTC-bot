@@ -1,29 +1,25 @@
 """
 main.py
 
-BTC bot -- two-leg hedge orchestrator (Bybit V5, Demo Trading by default).
+TRX bot -- one-way accumulation bot on TRX/USDC perpetual (Bybit V5, Demo
+Trading by default). Strategy rules: see `strategy.py`.
 
 Loop (every `polling.tick_poll_interval_sec`), always under `_position_lock`:
-  1. If a CLOSE ALL is in progress, keep closing whatever is still open; once
-     both legs are flat, settle the cycle (see 4).
-  2. Otherwise make sure both legs are open at the sequence's target notional
-     (BTC/USDT SHORT + BTC/USDC LONG, market orders). A leg that failed to
-     open is retried after OPEN_RETRY_DELAY_SEC.
-  3. With both legs open: poll realized funding, evaluate the two-leg net TP
-     (`strategy.check_take_profit`). A hit starts CLOSE ALL.
-  4. Settlement: realized net per coin -> sequence totals -> decision
-     (`strategy.decide_after_close`):
-       - NEW_SEQUENCE (only when the winning coin can repay the losing coin
-         AND has >= the spot minimum left for BTC): repay via a spot
-         conversion, buy BTC spot with the rest, restart at base notional;
-       - MULTIPLY: cumulative per-leg multipliers (TP leg x2, other x1.5);
-       - STOP (only if max_multiplier_steps is set): stay flat and halt.
-     Then the next cycle opens immediately.
+  1. Read the last price and reconcile the local position book with Bybit's
+     real net position (a manual close/change on Bybit is detected here and
+     the book is resynced instead of trading on a stale picture).
+  2. Poll realized funding (every `funding_poll_interval_sec`).
+  3. Reversal check: net position `reversal_pct`% in profit past its net
+     break-even -> the active direction flips (`strategy.reversal_signal`).
+  4. Once per timeframe bucket (1m), ORDER_OFFSET_SEC after the boundary:
+     fire one market order of `base_notional` in the active direction.
+     At first start the first order fires immediately.
 
-State that must survive a restart (sequence id, step, per-leg target
-notionals, per-coin sequence net) lives in `paths.runtime_state_path`.
+State that must survive a restart (active direction, base notional,
+position book, last order slot) lives in `paths.runtime_state_path`.
 
-Clean remote shutdown: create a file named STOP next to main.py.
+Clean remote shutdown: create a file named STOP next to main.py (the open
+position is left as is).
 """
 
 from __future__ import annotations
@@ -34,54 +30,41 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Callable, Optional
 
-from analytics import AnalyticsEngine, CycleRecord, LegResult
+from analytics import AnalyticsEngine, EpisodeRecord, OrderRecord, ReversalRecord
 from data_exporter import DataExporter
-from exchange import ExchangeClient, FilledOrder
-from fees import LegPosition, gross_pnl, realized_leg_net
+from exchange import ExchangeClient
 from strategy import (
-    BOT_NAME, MULTIPLY, NEW_SEQUENCE, STOP, Decision, SequenceState, StrategyConfig,
-    check_take_profit, decide_after_close, effective_base_notional, evaluate_legs,
-    plan_spot_settlement, qty_for_notional,
+    BOT_NAME, BotState, ClosedEpisode, PositionBook, StrategyConfig, base_notional_from_equity,
+    breakeven_net, order_side_for, qty_for_notional, reversal_signal, timeframe_slot,
 )
 
-logger = logging.getLogger("btc_bot.main")
+logger = logging.getLogger("trx_bot.main")
 
-BOT_VERSION = "2.0"
+BOT_VERSION = "3.0"
 CONFIG_PATH = "config.json"
 STOP_SIGNAL_PATH = Path("STOP")
-OPEN_RETRY_DELAY_SEC = 30.0
+ORDER_OFFSET_SEC = 1.0          # fire each minute's order 1s after the boundary
 HEARTBEAT_INTERVAL_SEC = 300.0
+FALLBACK_MIN_ORDER_VALUE = 5.0  # Bybit linear minimum order value, used if metadata lookup fails
 
 
-class BtcBot:
-    def __init__(self, cfg: StrategyConfig):
+class TrxBot:
+    def __init__(self, cfg: StrategyConfig, clock: Callable[[], float] = time.time):
         self.cfg = cfg
-        self.fees = cfg.fee_schedule
+        self.now = clock
         self.exchange = ExchangeClient(cfg)
         self.analytics = AnalyticsEngine(cfg.trade_history_path)
         self.exporter = DataExporter(cfg.state_export_path, self.analytics)
         self.runtime_state_path = Path(cfg.runtime_state_path)
 
-        self.seq: Optional[SequenceState] = None
-        self.legs: Dict[str, LegPosition] = {}
-        self.cycle_start_ts_ms = int(time.time() * 1000)
-
-        # CLOSE ALL in progress: the leg that hit TP, and the close fills
-        # collected so far (a leg whose close failed is retried next tick).
-        self._closing_tp_leg: Optional[str] = None
-        self._close_fills: Dict[str, Optional[FilledOrder]] = {}
-        self._close_marks: Dict[str, float] = {}
-
-        # Realized funding, per leg: dedup by settlement id + moving window.
-        self._funding_ids: Dict[str, set] = {}
-        self._funding_since_ms: Dict[str, int] = {}
+        self.state: Optional[BotState] = None
+        self.last_price: Optional[float] = None
+        self._funding_ids: set = set()
+        self._funding_since_ms: Optional[int] = None
         self._last_funding_poll = 0.0
-
-        self._open_retry_after = 0.0
         self._last_heartbeat = 0.0
-        self._halted = False
         self._stop_event = asyncio.Event()
         self._position_lock = asyncio.Lock()
         self._background_tasks: set = set()
@@ -89,18 +72,13 @@ class BtcBot:
     # -- lifecycle -----------------------------------------------------------
 
     async def start(self) -> None:
-        short, long_ = self.cfg.legs["short"], self.cfg.legs["long"]
-        logger.info("[INFO] Avvio %s v%s -- SHORT %s + LONG %s, leva %dx, TP netto %.2f%%, "
-                    "moltiplicatori x%.2f/x%.2f, max_multiplier_steps=%s, %s",
-                    BOT_NAME, BOT_VERSION, short.symbol, long_.symbol, self.cfg.leverage,
-                    self.cfg.take_profit_net_pct, self.cfg.winner_multiplier, self.cfg.loser_multiplier,
-                    self.cfg.max_multiplier_steps, "DEMO" if self.cfg.use_testnet else "PRODUZIONE")
+        logger.info("[INFO] Avvio %s v%s -- %s leva %dx one-way, timeframe %s, inversione a %.2f%% oltre il "
+                    "breakeven netto, %s", BOT_NAME, BOT_VERSION, self.cfg.symbol, self.cfg.leverage,
+                    self.cfg.timeframe, self.cfg.reversal_pct, "DEMO" if self.cfg.use_testnet else "PRODUZIONE")
         await self.exchange.setup()
         await self._bootstrap()
-        self._notify_text("Avvio", [
-            f"Sequenza #{self.seq.sequence_id}, passo {self.seq.step}",
-            f"Target: SHORT {self.seq.notionals['short']:.2f} / LONG {self.seq.notionals['long']:.2f}",
-        ])
+        self._notify("Avvio", [f"Direzione attiva: <b>{self.state.mode.upper()}</b>",
+                               f"Importo per ordine: {self.state.base_notional:.2f} USDC"])
         await self._tick_loop()
 
     async def stop(self) -> None:
@@ -112,74 +90,60 @@ class BtcBot:
     # -- bootstrap / persistence --------------------------------------------
 
     async def _bootstrap(self) -> None:
-        self.seq = self._load_runtime_state()
-        positions = await self.exchange.fetch_open_positions()
+        self.state = self._load_state()
+        if self.state is None:
+            price = await self.exchange.fetch_last_price()
+            base = await self._compute_base_notional(price)
+            book = PositionBook()
+            pos = await self.exchange.fetch_position()
+            if pos is not None:
+                book = self._book_from_exchange(pos, episode_id=1)
+                logger.warning("Posizione esistente su %s adottata: %s qty=%.0f entry=%.5f.",
+                               self.cfg.symbol, pos.side.upper(), pos.qty, pos.entry_price)
+            self.state = BotState(mode=self.cfg.initial_direction, base_notional=base, book=book)
+            logger.info("Primo avvio: direzione %s, importo per ordine %.2f USDC.", self.state.mode.upper(), base)
+            await self._fire_order(price)  # "all'avvio apre la posizione"
+        self._save_state()
 
-        if self.seq is None:
-            base = await self._compute_base_notional()
-            last_seq = max((c.sequence_id for c in self.analytics.cycles), default=0)
-            self.seq = SequenceState.new(base, sequence_id=last_seq + 1,
-                                         cycle_id=len(self.analytics.cycles) + 1)
-            logger.info("Nessuno stato salvato: nuova sequenza #%d, base %.2f per gamba.",
-                        self.seq.sequence_id, base)
-
-        for name, leg_cfg in self.cfg.legs.items():
-            pos = positions.get(leg_cfg.symbol)
-            if pos is None:
-                continue
-            if pos.side != leg_cfg.side:
-                self._halted = True
-                raise RuntimeError(
-                    f"Posizione esistente su {leg_cfg.symbol} e' {pos.side.upper()}, attesa "
-                    f"{leg_cfg.side.upper()}: chiudila a mano prima di avviare {BOT_NAME}."
-                )
-            self.legs[name] = LegPosition(
-                name=name, symbol=leg_cfg.symbol, side=leg_cfg.side, settle_coin=leg_cfg.settle_coin,
-                qty=pos.qty, entry_price=pos.entry_price,
-                # the real opening fee is not recoverable after a restart: estimate it
-                open_fee=self.fees.taker_fee_for_notional(pos.entry_price * pos.qty),
-            )
-            logger.warning("Posizione esistente riconciliata: %s %s qty=%.6f entry=%.2f (fee apertura stimata).",
-                           leg_cfg.side.upper(), leg_cfg.symbol, pos.qty, pos.entry_price)
-        self._save_runtime_state()
-
-    def _load_runtime_state(self) -> Optional[SequenceState]:
+    def _load_state(self) -> Optional[BotState]:
         if not self.runtime_state_path.exists():
             return None
         try:
-            seq = SequenceState.from_dict(json.loads(self.runtime_state_path.read_text(encoding="utf-8")))
-            logger.info("Stato ripreso: sequenza #%d passo %d, target SHORT %.2f / LONG %.2f, netto %s.",
-                        seq.sequence_id, seq.step, seq.notionals["short"], seq.notionals["long"],
-                        seq.net_by_coin)
-            return seq
+            state = BotState.from_dict(json.loads(self.runtime_state_path.read_text(encoding="utf-8")))
+            logger.info("Stato ripreso: direzione %s, importo %.2f, posizione %s qty=%.0f, ordini %d.",
+                        state.mode.upper(), state.base_notional, (state.book.side or "flat").upper(),
+                        state.book.qty, state.orders_count)
+            return state
         except Exception:
-            logger.exception("Stato %s illeggibile: riparto da una nuova sequenza.", self.runtime_state_path)
+            logger.exception("Stato %s illeggibile: riparto da zero.", self.runtime_state_path)
             return None
 
-    def _save_runtime_state(self) -> None:
+    def _save_state(self) -> None:
         tmp = self.runtime_state_path.with_suffix(".tmp")
         try:
-            tmp.write_text(json.dumps(self.seq.to_dict(), indent=2), encoding="utf-8")
+            tmp.write_text(json.dumps(self.state.to_dict(), indent=2), encoding="utf-8")
             tmp.replace(self.runtime_state_path)
         except OSError:
             logger.exception("Salvataggio stato %s fallito", self.runtime_state_path)
 
-    async def _compute_base_notional(self) -> float:
-        prices = await self.exchange.fetch_last_prices(l.symbol for l in self.cfg.legs.values())
-        mins = {name: self.exchange.min_order_qty(l.symbol) * prices[l.symbol]
-                for name, l in self.cfg.legs.items()}
+    async def _compute_base_notional(self, price: float) -> float:
+        min_value = max(self.exchange.min_order_notional() or FALLBACK_MIN_ORDER_VALUE,
+                        self.exchange.min_order_qty() * price)
         equity = 0.0
         if self.cfg.equity_based_sizing_enabled:
             try:
                 equity = await self.exchange.fetch_total_equity()
             except Exception:
                 logger.exception("Lettura equity fallita: uso base_notional_usd=%.2f.", self.cfg.base_notional_usd)
-        base = effective_base_notional(equity, self.cfg.equity_based_sizing_percentage,
-                                       self.cfg.base_notional_usd, mins)
-        logger.info("Base notional per gamba: %.2f (equity %.2f x %.2f%%, minimi exchange %s).",
-                    base, equity, self.cfg.equity_based_sizing_percentage,
-                    {k: round(v, 2) for k, v in mins.items()})
+        base = base_notional_from_equity(equity, self.cfg.equity_based_sizing_percentage,
+                                         self.cfg.base_notional_usd, min_value)
+        logger.info("Importo per ordine: %.2f USDC (equity %.2f x %.2f%%, minimo exchange %.2f).",
+                    base, equity, self.cfg.equity_based_sizing_percentage, min_value)
         return base
+
+    def _book_from_exchange(self, pos, episode_id: int) -> PositionBook:
+        fee = self.cfg.taker_rate * pos.entry_price * pos.qty  # real opening fees unknown: estimate
+        return PositionBook(side=pos.side, qty=pos.qty, avg_entry=pos.entry_price, fees=fee, episode_id=episode_id)
 
     # -- main loop -----------------------------------------------------------
 
@@ -193,294 +157,183 @@ class BtcBot:
                 break
 
     async def _tick(self) -> None:
-        if self._halted:
-            return
-        prices = await self.exchange.fetch_last_prices(l.symbol for l in self.cfg.legs.values())
-        marks = {name: prices[l.symbol] for name, l in self.cfg.legs.items()}
-
+        price = await self.exchange.fetch_last_price()
+        self.last_price = price
         async with self._position_lock:
-            if self._closing_tp_leg is not None:
-                await self._continue_close_all(marks)
-                return
-
-            await self._ensure_legs_open(marks)
-            if len(self.legs) != len(self.cfg.legs):
-                self._export(marks)
-                return
-
+            await self._reconcile_with_exchange()
             await self._maybe_poll_funding()
-            signal = check_take_profit(self.legs, marks, self.fees, self.cfg.take_profit_net_pct)
-            self._export(marks)
-            self._maybe_heartbeat(marks)
-            if signal is None:
-                return
+            self._maybe_reverse(price)
 
-            bd = signal.breakdown
-            logger.info("TAKE PROFIT gamba %s: netto due gambe %.4f (%.3f%% su notional %.2f) = lordo %.4f "
-                        "- fee apertura %.4f - fee chiusura stimate %.4f + funding %.4f. CLOSE ALL.",
-                        signal.leg.upper(), bd.net_pnl, bd.net_pct, bd.notional, bd.gross_pnl,
-                        bd.open_fees, bd.close_fees_est, bd.funding)
-            self._closing_tp_leg = signal.leg
-            self._close_fills = {}
-            self._close_marks = dict(marks)
-            await self._continue_close_all(marks)
+            now = self.now()
+            slot = timeframe_slot(now, self.cfg.timeframe_sec)
+            if slot > self.state.last_order_slot and (now % self.cfg.timeframe_sec) >= ORDER_OFFSET_SEC:
+                await self._fire_order(price)
+                self._maybe_reverse(self.last_price)  # the fill itself can move the break-even
 
-    async def _ensure_legs_open(self, marks: Dict[str, float]) -> None:
-        missing = [name for name in self.cfg.legs if name not in self.legs]
-        if not missing or time.monotonic() < self._open_retry_after:
-            return
-        if not self.legs:
-            self.cycle_start_ts_ms = int(time.time() * 1000)
-            self._reset_funding_tracking()
-        for name in missing:
-            leg_cfg = self.cfg.legs[name]
-            target = self.seq.notionals[name]
-            qty = qty_for_notional(target, marks[name], self.exchange.qty_step(leg_cfg.symbol),
-                                   self.exchange.min_order_qty(leg_cfg.symbol))
-            try:
-                filled = await self.exchange.open_position_market(leg_cfg.symbol, leg_cfg.side, qty)
-            except Exception:
-                logger.exception("Apertura %s %s fallita (qty=%.6f): riprovo tra %.0fs.",
-                                 leg_cfg.side.upper(), leg_cfg.symbol, qty, OPEN_RETRY_DELAY_SEC)
-                self._open_retry_after = time.monotonic() + OPEN_RETRY_DELAY_SEC
-                return
-            if filled.qty <= 0 or filled.price <= 0:
-                logger.error("Apertura %s senza fill valido (%s): riprovo tra %.0fs.", leg_cfg.symbol, filled,
-                             OPEN_RETRY_DELAY_SEC)
-                self._open_retry_after = time.monotonic() + OPEN_RETRY_DELAY_SEC
-                return
-            fee = filled.fee if filled.fee is not None else self.fees.taker_fee_for_notional(filled.notional)
-            self.legs[name] = LegPosition(name=name, symbol=leg_cfg.symbol, side=leg_cfg.side,
-                                          settle_coin=leg_cfg.settle_coin, qty=filled.qty,
-                                          entry_price=filled.price, open_fee=fee)
-            logger.info("Aperta %s %s: qty=%.6f @ %.2f (notional %.2f, target %.2f, fee %.4f) -- "
-                        "sequenza #%d passo %d, ciclo #%d.",
-                        leg_cfg.side.upper(), leg_cfg.symbol, filled.qty, filled.price, filled.notional,
-                        target, fee, self.seq.sequence_id, self.seq.step, self.seq.cycle_id)
+            self._save_state()
+            self._export(price)
+            self._maybe_heartbeat(price)
 
-    # -- close all + settlement ---------------------------------------------
-
-    async def _continue_close_all(self, marks: Dict[str, float]) -> None:
-        for name, leg in self.legs.items():
-            if name in self._close_fills:
-                continue
-            try:
-                filled = await self.exchange.close_position_market(leg.symbol)
-            except Exception:
-                logger.exception("Chiusura %s fallita: riprovo al prossimo tick.", leg.symbol)
-                return
-            if filled is None:
-                logger.error("Nessuna posizione trovata su %s in chiusura: uso il prezzo %.2f come uscita.",
-                             leg.symbol, marks[name])
-            self._close_fills[name] = filled
-            self._close_marks[name] = marks[name]
-        await self._settle_cycle()
-
-    async def _settle_cycle(self) -> None:
-        tp_leg = self._closing_tp_leg
-        seq = self.seq
-        leg_results = []
-        net_by_coin: Dict[str, float] = {}
-        for name, leg in self.legs.items():
-            filled = self._close_fills.get(name)
-            exit_price = filled.price if filled is not None and filled.price > 0 else self._close_marks[name]
-            close_fee = (filled.fee if filled is not None and filled.fee is not None
-                         else self.fees.taker_fee_for_notional(exit_price * leg.qty))
-            net = realized_leg_net(leg, exit_price, close_fee)
-            net_by_coin[leg.settle_coin] = net_by_coin.get(leg.settle_coin, 0.0) + net
-            leg_results.append(LegResult(
-                leg=name, symbol=leg.symbol, side=leg.side, settle_coin=leg.settle_coin, qty=leg.qty,
-                entry_price=leg.entry_price, exit_price=exit_price, notional=leg.notional,
-                gross_pnl=gross_pnl(leg.side, leg.entry_price, exit_price, leg.qty),
-                open_fee=leg.open_fee, close_fee=close_fee, funding=leg.funding, net_pnl=net,
-            ))
-
-        seq.add_cycle_result(net_by_coin)
-        decision = decide_after_close(seq, tp_leg, self.cfg.winner_multiplier, self.cfg.loser_multiplier,
-                                      self.cfg.max_multiplier_steps, self.cfg.spot_min_order_value)
-        logger.info("CLOSE ALL completato (ciclo #%d): netto ciclo %s | netto sequenza #%d %s (totale %.4f) "
-                    "-> %s", seq.cycle_id, _fmt(net_by_coin), seq.sequence_id, _fmt(seq.net_by_coin),
-                    seq.total_net, decision.action.upper())
-
-        spot_actions = []
-        if decision.action == NEW_SEQUENCE and self.cfg.settlement_enabled:
-            spot_actions = await self._spot_settlement(decision)
-
-        record = CycleRecord(
-            cycle_id=seq.cycle_id, sequence_id=seq.sequence_id, step=seq.step,
-            start_ts_ms=self.cycle_start_ts_ms, end_ts_ms=int(time.time() * 1000), tp_leg=tp_leg,
-            legs=leg_results, net_by_coin=net_by_coin, sequence_net_by_coin=dict(seq.net_by_coin),
-            decision=decision.action, spot_actions=spot_actions,
-        )
+    async def _fire_order(self, price: float) -> None:
+        st = self.state
+        st.last_order_slot = timeframe_slot(self.now(), self.cfg.timeframe_sec)  # one attempt per bucket
+        side = order_side_for(st.mode)
+        qty = qty_for_notional(st.base_notional, price, self.exchange.qty_step(), self.exchange.min_order_qty())
         try:
-            self.analytics.record_cycle(record)
+            filled = await self.exchange.place_market_order(side, qty)
         except Exception:
-            logger.exception("Registrazione ciclo nello storico fallita (stato del bot comunque aggiornato).")
-        self._spawn_background("notifier", "notify_cycle_closed", self.exchange, self.cfg.notifier_enabled, record)
+            logger.exception("Ordine %s %s qty=%.0f fallito: riprovo al prossimo minuto.",
+                             side.upper(), self.cfg.symbol, qty)
+            return
+        if filled.qty <= 0 or filled.price <= 0:
+            logger.error("Ordine %s senza fill valido: %s", side.upper(), filled)
+            return
+        fee = filled.fee if filled.fee is not None else self.cfg.taker_rate * filled.notional
+        closed = st.book.apply_fill(side, filled.qty, filled.price, fee)
+        st.orders_count += 1
+        self.last_price = filled.price
+        book = st.book
+        be = breakeven_net(book, self.cfg.taker_rate)
+        logger.info("Ordine #%d %s %.0f TRX @ %.5f (%.2f USDC, fee %.4f) -> posizione %s %.0f, BE netto %s",
+                    st.orders_count, side.upper(), filled.qty, filled.price, filled.notional, fee,
+                    (book.side or "flat").upper(), book.qty, f"{be:.5f}" if be else "-")
+        try:
+            self.analytics.record_order(OrderRecord(
+                timestamp_ms=filled.timestamp_ms, mode=st.mode, side=side, qty=filled.qty, price=filled.price,
+                fee=fee, position_side=book.side or "flat", position_qty=book.qty))
+        except Exception:
+            logger.exception("Registrazione ordine nello storico fallita.")
+        if closed is not None:
+            self._on_episode_closed(closed)
 
-        # -- next cycle --
-        if decision.action == NEW_SEQUENCE:
-            base = await self._compute_base_notional()
-            self.seq = SequenceState.new(base, sequence_id=seq.sequence_id + 1, cycle_id=seq.cycle_id + 1)
-        elif decision.action == MULTIPLY:
-            seq.notionals = decision.next_notionals
-            seq.step += 1
-            seq.cycle_id += 1
-        else:  # STOP
-            seq.cycle_id += 1
-            self._halted = True
-            logger.warning("max_multiplier_steps=%s raggiunto: %s resta FLAT e si ferma.",
-                           self.cfg.max_multiplier_steps, BOT_NAME)
-            self._notify_text("STOP", [f"max_multiplier_steps={self.cfg.max_multiplier_steps} raggiunto: "
-                                       "posizioni chiuse, nessuna riapertura."])
-            self._stop_event.set()
+    def _maybe_reverse(self, price: Optional[float]) -> None:
+        if price is None:
+            return
+        st = self.state
+        new_mode = reversal_signal(st.mode, st.book, price, self.cfg.reversal_pct, self.cfg.taker_rate)
+        if new_mode is None:
+            return
+        be = breakeven_net(st.book, self.cfg.taker_rate)
+        logger.info("INVERSIONE %s -> %s: prezzo %.5f, posizione %s %.0f, BE netto %.5f (oltre il %.2f%%).",
+                    st.mode.upper(), new_mode.upper(), price, st.book.side.upper(), st.book.qty, be,
+                    self.cfg.reversal_pct)
+        try:
+            self.analytics.record_reversal(ReversalRecord(
+                timestamp_ms=int(self.now() * 1000), from_mode=st.mode, to_mode=new_mode, price=price,
+                breakeven_net=be, position_side=st.book.side, position_qty=st.book.qty))
+        except Exception:
+            logger.exception("Registrazione inversione nello storico fallita.")
+        self._notify("Inversione", [f"{st.mode.upper()} → <b>{new_mode.upper()}</b> a {price:.5f}",
+                                    f"Posizione {st.book.side.upper()} {st.book.qty:.0f} TRX, BE netto {be:.5f}"])
+        st.mode = new_mode
 
-        self.legs = {}
-        self._closing_tp_leg = None
-        self._close_fills = {}
-        self._close_marks = {}
-        self._reset_funding_tracking()
-        self._save_runtime_state()
-        if decision.action != STOP:
-            logger.info("Nuovo ciclo #%d (sequenza #%d passo %d): SHORT %.2f / LONG %.2f.",
-                        self.seq.cycle_id, self.seq.sequence_id, self.seq.step,
-                        self.seq.notionals["short"], self.seq.notionals["long"])
-            prices = await self.exchange.fetch_last_prices(l.symbol for l in self.cfg.legs.values())
-            await self._ensure_legs_open({n: prices[l.symbol] for n, l in self.cfg.legs.items()})
+    def _on_episode_closed(self, ep: ClosedEpisode) -> None:
+        logger.info("Posizione %s (episodio #%d) chiusa: netto %.4f USDC (lordo %.4f, fee %.4f, funding %.4f).",
+                    ep.side.upper(), ep.episode_id, ep.net, ep.realized_gross, ep.fees, ep.funding)
+        try:
+            self.analytics.record_episode(EpisodeRecord(
+                timestamp_ms=int(self.now() * 1000), episode_id=ep.episode_id, side=ep.side,
+                realized_gross=ep.realized_gross, fees=ep.fees, funding=ep.funding, net=ep.net))
+        except Exception:
+            logger.exception("Registrazione episodio nello storico fallita.")
+        self._notify(f"Posizione {ep.side.upper()} chiusa", [f"Netto: <b>{ep.net:+.4f} USDC</b>"])
+        self._funding_ids.clear()
+        self._funding_since_ms = None
 
-    async def _spot_settlement(self, decision: Decision) -> list:
-        """Winning coin covers the losing coin's sequence loss via a SPOT
-        conversion on the stable pair (Bybit Demo rejects /v5/account/repay),
-        then buys BTC spot with the rest. Every step is best-effort: a failure
-        is logged and reported, never blocks the next cycle."""
-        actions = []
-        winner, loser = decision.winner_coin, decision.loser_coin
-        plan = decision.plan or plan_spot_settlement(
-            decision.repay_amount, decision.btc_buy_amount + decision.repay_amount, self.cfg.spot_min_order_value)
-        actions.extend(plan.notes)
-        stable = self.cfg.stable_conversion_symbol  # e.g. "USDC/USDT"
-        base_coin, quote_coin = stable.split("/")
-
-        if plan.convert_amount > 0 and loser:
-            try:
-                if winner == quote_coin and loser == base_coin:
-                    f = await self.exchange.spot_market_buy_with_cost(stable, plan.convert_amount)
-                elif winner == base_coin and loser == quote_coin:
-                    f = await self.exchange.spot_market_sell(stable, plan.convert_amount)
-                else:
-                    raise ValueError(f"Coppia {stable} non adatta a convertire {winner}->{loser}")
-                msg = f"repay {loser}: convertiti {plan.convert_amount:.4f} {winner} ({f.side} {f.qty:.4f} @ {f.price:.5f})"
-                logger.info("Settlement: %s", msg)
-                actions.append(msg)
-            except Exception:
-                logger.exception("Settlement: conversione %s->%s fallita.", winner, loser)
-                actions.append(f"repay {loser} FALLITO")
-
-            try:
-                balances = await self.exchange.fetch_coin_balances()
-                borrow = balances[loser].borrow_amount if loser in balances else 0.0
-                if borrow > 0:
-                    if await self.exchange.repay_via_endpoint(loser, borrow):
-                        actions.append(f"repay endpoint {loser} {borrow:.4f} OK")
-                    else:
-                        logger.warning("Settlement: debito %s residuo %.6f dopo la conversione.", loser, borrow)
-                        actions.append(f"debito {loser} residuo {borrow:.6f}")
-            except Exception:
-                logger.warning("Settlement: verifica debito %s fallita.", loser, exc_info=True)
-
-        if plan.btc_buy_amount > 0:
-            spot_symbol = next(l.spot_btc_symbol for l in self.cfg.legs.values() if l.settle_coin == winner)
-            try:
-                f = await self.exchange.spot_market_buy_with_cost(spot_symbol, plan.btc_buy_amount)
-                msg = f"acquistati {f.qty:.6f} BTC su {spot_symbol} @ {f.price:.2f} ({plan.btc_buy_amount:.4f} {winner})"
-                logger.info("Settlement: %s", msg)
-                actions.append(msg)
-            except Exception:
-                logger.exception("Settlement: acquisto BTC spot su %s fallito.", spot_symbol)
-                actions.append(f"acquisto BTC su {spot_symbol} FALLITO")
-        return actions
+    async def _reconcile_with_exchange(self) -> None:
+        """Bybit's real net position is the source of truth for SIDE and QTY.
+        A mismatch means someone changed the position outside the bot (e.g. a
+        manual close): the local book is resynced and the event logged."""
+        try:
+            pos = await self.exchange.fetch_position()
+        except Exception:
+            logger.warning("Lettura posizione per la riconciliazione fallita.", exc_info=True)
+            return
+        book = self.state.book
+        step = max(self.exchange.qty_step(), 1e-9)
+        if pos is None and book.is_flat:
+            return
+        if pos is not None and not book.is_flat and pos.side == book.side and abs(pos.qty - book.qty) < step / 2:
+            return
+        logger.warning("Posizione su Bybit (%s) diversa da quella del bot (%s %.0f): intervento esterno? "
+                       "Riallineo.", f"{pos.side.upper()} {pos.qty:.0f}" if pos else "FLAT",
+                       (book.side or "flat").upper(), book.qty)
+        next_id = book.episode_id + 1
+        self.state.book = self._book_from_exchange(pos, next_id) if pos else PositionBook(episode_id=next_id)
+        self._funding_ids.clear()
+        self._funding_since_ms = None
+        self._notify("Riallineamento", ["Posizione modificata fuori dal bot: stato riallineato a Bybit."])
 
     # -- funding -------------------------------------------------------------
 
-    def _reset_funding_tracking(self) -> None:
-        self._funding_ids = {name: set() for name in self.cfg.legs}
-        self._funding_since_ms = {name: self.cycle_start_ts_ms for name in self.cfg.legs}
-        self._last_funding_poll = 0.0
-
     async def _maybe_poll_funding(self) -> None:
-        """REALIZED funding from the exchange ledger (Bybit settles every 8h),
-        deduplicated by settlement id, with a per-leg window that advances past
-        each processed settlement."""
-        now = time.time()
+        """REALIZED funding from the exchange ledger (every 8h on Bybit),
+        deduplicated by settlement id, added to the current episode."""
+        if self.state.book.is_flat:
+            return
+        now = self.now()
         if now - self._last_funding_poll < self.cfg.funding_poll_interval_sec:
             return
         self._last_funding_poll = now
-        for name, leg in self.legs.items():
-            since = self._funding_since_ms.get(name, self.cycle_start_ts_ms)
-            try:
-                settlements = await self.exchange.fetch_realized_funding(leg.symbol, since_ms=since)
-            except Exception:
-                logger.exception("Lettura funding realizzato %s fallita", leg.symbol)
+        since = self._funding_since_ms or int(now * 1000) - 8 * 3600 * 1000
+        try:
+            settlements = await self.exchange.fetch_realized_funding(since_ms=since)
+        except Exception:
+            logger.exception("Lettura funding realizzato fallita")
+            return
+        for fid, ts, cashflow in settlements:
+            self._funding_since_ms = max(self._funding_since_ms or 0, ts + 1)
+            if fid in self._funding_ids:
                 continue
-            seen = self._funding_ids.setdefault(name, set())
-            for fid, ts, cashflow in settlements:
-                self._funding_since_ms[name] = max(self._funding_since_ms.get(name, since), ts + 1)
-                if fid in seen:
-                    continue
-                seen.add(fid)
-                leg.funding += cashflow
-                logger.info("Funding realizzato %s: %.6f %s", leg.symbol, cashflow, leg.settle_coin)
+            self._funding_ids.add(fid)
+            self.state.book.funding += cashflow
+            logger.info("Funding realizzato: %+.6f USDC", cashflow)
 
     # -- export / helpers ----------------------------------------------------
 
-    def _export(self, marks: Dict[str, float]) -> None:
-        breakdowns = evaluate_legs(self.legs, marks, self.fees) if len(self.legs) == len(self.cfg.legs) else {}
-        live = {
-            "timestamp_ms": int(time.time() * 1000),
+    def _export(self, price: float) -> None:
+        st = self.state
+        be = breakeven_net(st.book, self.cfg.taker_rate)
+        trigger = None
+        if be is not None:
+            trigger = be * (1 - self.cfg.reversal_pct / 100) if st.book.side == "short" else \
+                be * (1 + self.cfg.reversal_pct / 100)
+        self.exporter.export({
+            "timestamp_ms": int(self.now() * 1000),
             "bot": BOT_NAME,
             "version": BOT_VERSION,
-            "sequence": self.seq.to_dict() if self.seq else None,
-            "cycle_start_ts_ms": self.cycle_start_ts_ms,
-            "take_profit_net_pct": self.cfg.take_profit_net_pct,
-            "legs": {
-                name: {
-                    "symbol": leg.symbol, "side": leg.side, "settle_coin": leg.settle_coin,
-                    "qty": leg.qty, "entry_price": leg.entry_price, "notional": leg.notional,
-                    "mark_price": marks.get(name), "open_fee": leg.open_fee, "funding": leg.funding,
-                    "two_leg_net": breakdowns[name].net_pnl if name in breakdowns else None,
-                    "two_leg_net_pct": breakdowns[name].net_pct if name in breakdowns else None,
-                }
-                for name, leg in self.legs.items()
-            },
-            "closing": self._closing_tp_leg,
-            "halted": self._halted,
-        }
-        self.exporter.export(live)
+            "symbol": self.cfg.symbol,
+            "price": price,
+            "mode": st.mode,
+            "base_notional": st.base_notional,
+            "orders_count": st.orders_count,
+            "position": st.book.to_dict(),
+            "breakeven_net": be,
+            "reversal_trigger_price": trigger,
+        })
 
-    def _maybe_heartbeat(self, marks: Dict[str, float]) -> None:
-        now = time.monotonic()
+    def _maybe_heartbeat(self, price: float) -> None:
+        now = self.now()
         if now - self._last_heartbeat < HEARTBEAT_INTERVAL_SEC:
             return
         self._last_heartbeat = now
-        bds = evaluate_legs(self.legs, marks, self.fees)
-        logger.info("Stato: ciclo #%d seq #%d passo %d | SHORT netto2g %.3f%% | LONG netto2g %.3f%% | "
-                    "obiettivo %.2f%%", self.seq.cycle_id, self.seq.sequence_id, self.seq.step,
-                    bds["short"].net_pct, bds["long"].net_pct, self.cfg.take_profit_net_pct)
+        st = self.state
+        be = breakeven_net(st.book, self.cfg.taker_rate)
+        dist = f"{(price / be - 1) * 100:+.3f}%" if be else "-"
+        logger.info("Stato: direzione %s | posizione %s %.0f TRX (%.2f USDC) | prezzo %.5f | BE netto %s (%s) | "
+                    "ordini %d", st.mode.upper(), (st.book.side or "flat").upper(), st.book.qty,
+                    st.book.notional, price, f"{be:.5f}" if be else "-", dist, st.orders_count)
 
-    def _notify_text(self, title: str, body: list) -> None:
-        self._spawn_background("notifier", "notify_text", self.exchange, self.cfg.notifier_enabled, title, body)
-
-    def _spawn_background(self, module: str, func: str, *args) -> None:
-        """Fire-and-forget optional feature (notifier): local import, own
-        try/except, strong reference kept until done -- it can never block or
-        crash the trading loop."""
+    def _notify(self, title: str, body: list) -> None:
+        """Fire-and-forget Telegram message: local import, own try/except,
+        strong reference kept until done -- never blocks the trading loop."""
         try:
-            mod = __import__(module)
-            task = asyncio.create_task(getattr(mod, func)(*args))
+            import notifier
+            task = asyncio.create_task(notifier.notify_text(self.exchange, self.cfg.notifier_enabled, title, body))
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
         except Exception:
-            logger.debug("Task in background %s.%s non avviato.", module, func, exc_info=True)
+            logger.debug("Notifica '%s' non avviata.", title, exc_info=True)
 
     async def _wait_or_stop(self, timeout_sec: float) -> bool:
         self._check_stop_file()
@@ -497,12 +350,8 @@ class BtcBot:
             STOP_SIGNAL_PATH.unlink()
         except OSError:
             pass
-        logger.info("File '%s' rilevato: arresto pulito (le posizioni restano aperte).", STOP_SIGNAL_PATH)
+        logger.info("File '%s' rilevato: arresto pulito (la posizione resta aperta).", STOP_SIGNAL_PATH)
         self._stop_event.set()
-
-
-def _fmt(d: Dict[str, float]) -> str:
-    return ", ".join(f"{k} {v:+.4f}" for k, v in d.items()) or "-"
 
 
 async def _run() -> None:
@@ -510,9 +359,9 @@ async def _run() -> None:
     # DEBUG only for the bot's own namespace (LOG_LEVEL=DEBUG): ccxt's own DEBUG
     # output would dump signed requests, API key header included.
     debug = os.environ.get("LOG_LEVEL", "").strip().upper() == "DEBUG"
-    logging.getLogger("btc_bot").setLevel(logging.DEBUG if debug else logging.INFO)
+    logging.getLogger("trx_bot").setLevel(logging.DEBUG if debug else logging.INFO)
     cfg = StrategyConfig.load(CONFIG_PATH)
-    bot = BtcBot(cfg)
+    bot = TrxBot(cfg)
     try:
         await bot.start()
     finally:
