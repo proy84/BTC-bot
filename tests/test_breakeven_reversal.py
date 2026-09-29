@@ -3,7 +3,7 @@
 import pytest
 
 from fees import gross_pnl
-from strategy import PositionBook, breakeven_net, qty_for_notional, reversal_signal, timeframe_slot
+from strategy import PositionBook, breakeven_net, qty_for_notional, reversal_signal
 
 F = 0.00055
 PCT = 0.5
@@ -70,5 +70,10 @@ def test_qty_rounding_trx():
     assert qty_for_notional(0.1, 0.3347, qty_step=1, min_qty=1) == 1
 
 
-def test_timeframe_slot():
-    assert timeframe_slot(119.9, 60) == 1 and timeframe_slot(120.0, 60) == 2
+def test_qty_never_below_min_order_value():
+    # 5 USDC at 0.3343: nearest step would be 15 TRX = 5.01, below the 5.05 target -> round UP to 16
+    assert qty_for_notional(5.0, 0.3343, 1, 1, min_notional=5.05) == 16
+    # 5 USDC at 0.30: 17 TRX = 5.10 already above -> unchanged
+    assert qty_for_notional(5.0, 0.30, 1, 1, min_notional=5.05) == 17
+    # rounding DOWN below the minimum (14.4 -> 14 TRX = 4.82) is corrected up
+    assert qty_for_notional(5.0, 0.3472, 1, 1, min_notional=5.0) * 0.3472 >= 5.0

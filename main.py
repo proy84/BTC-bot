@@ -11,12 +11,13 @@ Loop (every `polling.tick_poll_interval_sec`), always under `_position_lock`:
   2. Poll realized funding (every `funding_poll_interval_sec`).
   3. Reversal check: net position `reversal_pct`% in profit past its net
      break-even -> the active direction flips (`strategy.reversal_signal`).
-  4. Once per timeframe bucket (1m), ORDER_OFFSET_SEC after the boundary:
-     fire one market order of `base_notional` in the active direction.
-     At first start the first order fires immediately.
+  4. When `timeframe_sec` (60s) have passed since the previous order, fire
+     one market order of `base_notional` in the active direction (never below
+     the exchange minimum order value). At first start the first order fires
+     immediately.
 
 State that must survive a restart (active direction, base notional,
-position book, last order slot) lives in `paths.runtime_state_path`.
+position book, time of the last order) lives in `paths.runtime_state_path`.
 
 Clean remote shutdown: create a file named STOP next to main.py (the open
 position is left as is).
@@ -37,7 +38,7 @@ from data_exporter import DataExporter
 from exchange import ExchangeClient
 from strategy import (
     BOT_NAME, BotState, ClosedEpisode, PositionBook, StrategyConfig, base_notional_from_equity,
-    breakeven_net, order_side_for, qty_for_notional, reversal_signal, timeframe_slot,
+    breakeven_net, order_side_for, qty_for_notional, reversal_signal,
 )
 
 logger = logging.getLogger("trx_bot.main")
@@ -45,7 +46,7 @@ logger = logging.getLogger("trx_bot.main")
 BOT_VERSION = "3.0"
 CONFIG_PATH = "config.json"
 STOP_SIGNAL_PATH = Path("STOP")
-ORDER_OFFSET_SEC = 1.0          # fire each minute's order 1s after the boundary
+MIN_ORDER_MARGIN = 1.01         # keep each order >= 1% above the exchange minimum value (price drift)
 HEARTBEAT_INTERVAL_SEC = 300.0
 FALLBACK_MIN_ORDER_VALUE = 5.0  # Bybit linear minimum order value, used if metadata lookup fails
 
@@ -61,6 +62,7 @@ class TrxBot:
 
         self.state: Optional[BotState] = None
         self.last_price: Optional[float] = None
+        self._min_order_value = FALLBACK_MIN_ORDER_VALUE
         self._funding_ids: set = set()
         self._funding_since_ms: Optional[int] = None
         self._last_funding_poll = 0.0
@@ -103,6 +105,14 @@ class TrxBot:
             self.state = BotState(mode=self.cfg.initial_direction, base_notional=base, book=book)
             logger.info("Primo avvio: direzione %s, importo per ordine %.2f USDC.", self.state.mode.upper(), base)
             await self._fire_order(price)  # "all'avvio apre la posizione"
+        else:
+            price = await self.exchange.fetch_last_price()
+            base = await self._compute_base_notional(price)
+            if not self.cfg.equity_based_sizing_enabled and abs(base - self.state.base_notional) > 1e-9:
+                # fixed-size mode (e.g. exchange minimum): a config change applies on restart
+                logger.info("Importo per ordine aggiornato da config: %.2f -> %.2f USDC.",
+                            self.state.base_notional, base)
+                self.state.base_notional = base
         self._save_state()
 
     def _load_state(self) -> Optional[BotState]:
@@ -129,6 +139,7 @@ class TrxBot:
     async def _compute_base_notional(self, price: float) -> float:
         min_value = max(self.exchange.min_order_notional() or FALLBACK_MIN_ORDER_VALUE,
                         self.exchange.min_order_qty() * price)
+        self._min_order_value = min_value
         equity = 0.0
         if self.cfg.equity_based_sizing_enabled:
             try:
@@ -164,9 +175,7 @@ class TrxBot:
             await self._maybe_poll_funding()
             self._maybe_reverse(price)
 
-            now = self.now()
-            slot = timeframe_slot(now, self.cfg.timeframe_sec)
-            if slot > self.state.last_order_slot and (now % self.cfg.timeframe_sec) >= ORDER_OFFSET_SEC:
+            if self.now() - self.state.last_order_ts >= self.cfg.timeframe_sec:
                 await self._fire_order(price)
                 self._maybe_reverse(self.last_price)  # the fill itself can move the break-even
 
@@ -176,9 +185,10 @@ class TrxBot:
 
     async def _fire_order(self, price: float) -> None:
         st = self.state
-        st.last_order_slot = timeframe_slot(self.now(), self.cfg.timeframe_sec)  # one attempt per bucket
+        st.last_order_ts = self.now()  # one attempt per timeframe, even if it fails
         side = order_side_for(st.mode)
-        qty = qty_for_notional(st.base_notional, price, self.exchange.qty_step(), self.exchange.min_order_qty())
+        qty = qty_for_notional(st.base_notional, price, self.exchange.qty_step(), self.exchange.min_order_qty(),
+                               min_notional=self._min_order_value * MIN_ORDER_MARGIN)
         try:
             filled = await self.exchange.place_market_order(side, qty)
         except Exception:

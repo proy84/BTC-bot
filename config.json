@@ -14,7 +14,7 @@
   "leverage": 75,
   "margin_mode": "cross",
 
-  "_comment_timeframe": "Ogni timeframe (1 minuto) il bot spara UN ordine a mercato di importo fisso nella direzione attiva. All'avvio il primo ordine parte subito.",
+  "_comment_timeframe": "Il bot spara UN ordine a mercato di importo fisso nella direzione attiva ogni timeframe (1 minuto), contato dall'ordine PRECEDENTE (non allineato all'orologio). All'avvio il primo ordine parte subito.",
   "timeframe": "1m",
   "initial_direction": "short",
 
@@ -26,12 +26,12 @@
     "maker_rate": 0.0002
   },
 
-  "_comment_sizing": "Importo di ogni ordine = percentage% dell'equity totale reale (totalEquity Bybit), letto al PRIMO avvio e poi fisso (salvato nello stato). Mai sotto il minimo exchange (5 USDC). base_notional_usd e' usato solo se la lettura dell'equity fallisce.",
+  "_comment_sizing": "Importo di ogni ordine. Config attuale: equity_based_sizing disattivato e base_notional_usd = 0 -> ogni ordine al MINIMO consentito da Bybit (5 USDC su TRXPERP), con quantita' arrotondata per eccesso (+1% di margine) cosi' non scende mai sotto il minimo. base_notional_usd > 0 -> importo fisso (mai sotto il minimo). equity_based_sizing.enabled = true -> percentage% dell'equity letto al primo avvio.",
   "equity_based_sizing": {
-    "enabled": true,
+    "enabled": false,
     "percentage": 1.0
   },
-  "base_notional_usd": 5.0,
+  "base_notional_usd": 0,
 
   "notifier": {
     "enabled": true

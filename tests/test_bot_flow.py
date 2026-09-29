@@ -77,6 +77,7 @@ def bot(tmp_path, monkeypatch):
     monkeypatch.setattr(bot_main, "ExchangeClient", FakeExchange)
     cfg = dataclasses.replace(
         StrategyConfig.load("config.json"), notifier_enabled=False, use_testnet=True,
+        equity_based_sizing_enabled=True, equity_based_sizing_percentage=1.0,
         trade_history_path=str(tmp_path / "hist.json"), state_export_path=str(tmp_path / "live.json"),
         runtime_state_path=str(tmp_path / "state.json"),
     )
@@ -93,14 +94,15 @@ def test_full_flow(bot):
         assert ex.orders == [("sell", 110.0, 0.30)]
         assert bot.state.mode == "short"
 
-        await bot._tick()                      # same minute: no new order
+        bot.now.t = 630.0                      # 30s after the first order: no new order
+        await bot._tick()
         assert len(ex.orders) == 1
 
-        bot.now.t = 661.5                      # next minute, 1.5s past the boundary
+        bot.now.t = 661.5                      # 61s after the first order
         await bot._tick()
         assert ex.orders[-1][0] == "sell" and bot.state.book.qty == 220
 
-        bot.now.t = 720.5                      # before ORDER_OFFSET_SEC: waits
+        bot.now.t = 720.5                      # only 59s after the previous order: waits
         await bot._tick()
         assert len(ex.orders) == 2
 
@@ -157,5 +159,25 @@ def test_restart_resumes_state(bot, tmp_path):
         assert bot2.state.mode == "long" and bot2.state.base_notional == pytest.approx(33.0)
         assert bot2.exchange.orders == []            # no extra opening order on restart
         assert bot2.state.book.qty == 110
+
+    asyncio.run(run())
+
+
+def test_minimum_order_sizing(tmp_path, monkeypatch):
+    """Current config: equity sizing off, base_notional_usd 0 -> exchange minimum (5 USDC)."""
+    monkeypatch.setattr(bot_main, "ExchangeClient", FakeExchange)
+    cfg = dataclasses.replace(
+        StrategyConfig.load("config.json"), notifier_enabled=False, use_testnet=True,
+        trade_history_path=str(tmp_path / "h.json"), state_export_path=str(tmp_path / "l.json"),
+        runtime_state_path=str(tmp_path / "s.json"),
+    )
+    assert cfg.equity_based_sizing_enabled is False and cfg.base_notional_usd == 0
+    bot = bot_main.TrxBot(cfg, clock=Clock(600.0))
+
+    async def run():
+        await bot._bootstrap()
+        assert bot.state.base_notional == pytest.approx(5.0)
+        side, qty, price = bot.exchange.orders[0]
+        assert side == "sell" and qty == 17 and qty * price >= 5.0   # 5 / 0.30 = 16.7 -> 17 TRX
 
     asyncio.run(run())

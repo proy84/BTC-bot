@@ -11,8 +11,8 @@ Lavora su **Bybit Demo Trading** (`USE_TESTNET=true` in `.env`, default).
 
 ## 1. Strategia
 
-1. **Avvio**: apre subito uno **SHORT** a mercato di importo = `equity_based_sizing.percentage`% dell'equity totale (default 1%). L'importo è calcolato al **primo avvio** e poi resta **fisso** (salvato nello stato); mai sotto il minimo exchange (5 USDC).
-2. **Ogni minuto** (timeframe `1m`, 1 s dopo lo scoccare del minuto) spara **un ordine a mercato dello stesso importo** nella **direzione attiva**.
+1. **Avvio**: apre subito uno **SHORT** a mercato dell'**importo minimo consentito da Bybit** (5 USDC su TRXPERP; config `base_notional_usd: 0`, `equity_based_sizing.enabled: false`). La quantità è arrotondata **per eccesso** con +1% di margine (es. 16–17 TRX), così l'ordine non scende mai sotto il minimo nemmeno se il prezzo si muove. In alternativa: importo fisso (`base_notional_usd > 0`) o % dell'equity (`equity_based_sizing.enabled: true`, letto al primo avvio).
+2. **Ogni minuto** — contato **dall'ordine precedente** (60 s), non allineato all'orologio — spara **un ordine a mercato dello stesso importo** nella **direzione attiva**. (Correzione 29/09: con l'allineamento all'orologio il primo e il secondo ordine partivano a pochi secondi di distanza.)
 3. **Posizione netta one-way**: gli ordini nella direzione opposta alla posizione la **riducono** (realizzando il PnL della parte ridotta); se la superano la posizione **cambia segno**.
 4. **Inversione** (`reversal_pct`, default 0,5%): quando la posizione netta è in profitto oltre lo 0,5% rispetto al suo **breakeven netto**:
    - posizione **SHORT** e prezzo ≤ BE × (1 − 0,5%) → direzione attiva **LONG**;
@@ -57,7 +57,7 @@ Avvio: `python main.py` · Test: `python -m pytest` · Log dettagliati: `LOG_LEV
 ## 3. Dettagli di funzionamento
 
 - **Riconciliazione a ogni tick**: la posizione netta reale su Bybit (lato e quantità) è la fonte di verità. Se non coincide con quella del bot (es. **chiusura manuale** da app), il bot lo segnala nel log/Telegram e si **riallinea** (nuovo episodio; prezzo medio preso da Bybit, fee di apertura stimate). Il prezzo medio del bot viene invece dai **propri fill**, perché sui perpetual USDC il settlement di sessione (ogni 8 h) può riscrivere l'`entryPrice` di Bybit.
-- **Un tentativo per minuto**: se un ordine fallisce (es. margine insufficiente) viene loggato e si riprova al minuto successivo, senza raffiche.
+- **Un tentativo ogni 60 s**: se un ordine fallisce (es. margine insufficiente) viene loggato e si riprova al minuto successivo, senza raffiche.
 - **Fee reali**: quelle riportate da Bybit nel fill; se assenti, stima `taker_rate × notional`.
 - **Funding realizzato**: letto dal registro Bybit (`/v5/execution/list`, supportato su Demo) ogni `funding_poll_interval_sec`, deduplicato per id, sommato all'episodio corrente. **Segno**: Bybit/ccxt lo riportano come *fee* (positivo = pagato); il bot lo converte in cashflow (positivo = incassato) — verificato su Demo il 29/09/2026 (test `test_funding_sign.py`).
 - **Riavvio**: `trx_bot_state.json` conserva direzione attiva, importo per ordine, posizione/episodio e ultimo minuto servito: nessun ordine extra al riavvio.
@@ -77,8 +77,8 @@ Avvio: `python main.py` · Test: `python -m pytest` · Log dettagliati: `LOG_LEV
 | `initial_direction` | `short` | direzione del primo ordine |
 | `reversal_pct` | 0.5 | % oltre il breakeven netto che fa invertire la direzione |
 | `fees.taker_rate` / `maker_rate` | 0.00055 / 0.0002 | per stime (le fee reali vengono dai fill) |
-| `equity_based_sizing.enabled` / `percentage` | true / 1.0 | importo per ordine = % dell'equity al primo avvio |
-| `base_notional_usd` | 5.0 | ripiego se la lettura equity fallisce |
+| `equity_based_sizing.enabled` / `percentage` | false / 1.0 | se true: importo per ordine = % dell'equity al primo avvio |
+| `base_notional_usd` | 0 | 0 = minimo exchange (5 USDC); > 0 = importo fisso (mai sotto il minimo). In modalità fissa il valore viene riletto a ogni riavvio |
 | `notifier.enabled` | true | Telegram (richiede le variabili in `.env`) |
 | `polling.tick_poll_interval_sec` | 2 | frequenza del tick |
 | `polling.funding_poll_interval_sec` | 300 | frequenza lettura funding |
@@ -91,8 +91,8 @@ Limiti Bybit su TRXPERP (verificati 29/09/2026): leva max 75x, qty minima 1 TRX,
 ## 5. Test
 `python -m pytest`:
 - `tests/test_position_book.py`: accumulo e prezzo medio, riduzione con PnL realizzato, chiusura esatta, cambio di segno con fee pro-quota.
-- `tests/test_breakeven_reversal.py`: breakeven netto che azzera l'episodio (fee, funding, parte realizzata), soglie di inversione esatte short→long e long→short, nessuna inversione in perdita, arrotondamento qty TRX, slot del timeframe.
-- `tests/test_bot_flow.py`: orchestratore con exchange finto e orologio simulato — primo ordine all'avvio, un ordine al minuto, inversione, cambio di segno e chiusura episodio, ritorno a short, riallineamento dopo chiusura manuale, ripresa dopo riavvio.
+- `tests/test_breakeven_reversal.py`: breakeven netto che azzera l'episodio (fee, funding, parte realizzata), soglie di inversione esatte short→long e long→short, nessuna inversione in perdita, arrotondamento qty TRX, quantità mai sotto il valore minimo d'ordine.
+- `tests/test_bot_flow.py`: orchestratore con exchange finto e orologio simulato — primo ordine all'avvio, un ordine ogni 60 s dall'ordine precedente, sizing al minimo exchange, inversione, cambio di segno e chiusura episodio, ritorno a short, riallineamento dopo chiusura manuale, ripresa dopo riavvio.
 - `tests/test_funding_sign.py`: conversione del segno del funding con i valori reali Demo.
 
 ---

@@ -6,10 +6,13 @@ the TRX/USDC perpetual (Bybit TRXPERP). No network/exchange dependency by
 design: exchange I/O lives in `exchange.py`, orchestration in `main.py`.
 
 Rules:
-  - At startup the bot opens a SHORT of `base notional` (percentage of total
-    equity, fixed when the bot starts).
-  - Every minute (timeframe 1m) it fires one more market order of the same
-    base notional in the ACTIVE DIRECTION (initially short).
+  - At startup the bot opens a SHORT of `base notional`: the exchange minimum
+    order value (5 USDC on TRXPERP) with the current config
+    (`base_notional_usd` = 0, equity sizing off); otherwise a fixed amount or
+    a percentage of total equity.
+  - Every timeframe (1m) -- counted from the PREVIOUS order, not aligned to
+    the clock -- it fires one more market order of the same base notional in
+    the ACTIVE DIRECTION (initially short).
   - One-way mode: there is a single NET position. Orders in the direction
     opposite to the position reduce it (and flip it if they exceed it).
   - Reversal: when the net position is `reversal_pct`% IN PROFIT relative to
@@ -264,24 +267,26 @@ def base_notional_from_equity(equity: float, percentage: float, fallback: float,
     return max(base, min_notional)
 
 
-def qty_for_notional(notional: float, price: float, qty_step: float, min_qty: float) -> float:
+def qty_for_notional(notional: float, price: float, qty_step: float, min_qty: float,
+                     min_notional: float = 0.0) -> float:
     """Order quantity for a target notional, rounded to the NEAREST exchange
-    step (half up), never below the exchange minimum."""
+    step (half up), never below the exchange minimum quantity -- and, when
+    `min_notional` is given, rounded UP as needed so that qty * price never
+    falls below it (Bybit rejects orders under the minimum order value)."""
     if price <= 0 or notional <= 0:
         return 0.0
-    raw = notional / price
-    if qty_step > 0:
-        qty = math.floor(raw / qty_step + 0.5 + 1e-9) * qty_step
+
+    def to_step(x: float, up: bool) -> float:
+        if qty_step <= 0:
+            return x
+        n = math.ceil(x / qty_step - 1e-9) if up else math.floor(x / qty_step + 0.5 + 1e-9)
         decimals = max(0, -int(math.floor(math.log10(qty_step)))) if qty_step < 1 else 0
-        qty = round(qty, decimals + 2)
-    else:
-        qty = raw
+        return round(n * qty_step, decimals + 2)
+
+    qty = to_step(notional / price, up=False)
+    if min_notional > 0 and qty * price < min_notional:
+        qty = to_step(min_notional / price, up=True)
     return max(qty, min_qty)
-
-
-def timeframe_slot(ts: float, timeframe_sec: int) -> int:
-    """Index of the timeframe bucket containing `ts` (one order per bucket)."""
-    return int(ts // timeframe_sec)
 
 
 @dataclass
@@ -290,15 +295,15 @@ class BotState:
     mode: str
     base_notional: float
     book: PositionBook
-    last_order_slot: int = -1
+    last_order_ts: float = 0.0  # unix time of the last order attempt; the next fires timeframe_sec later
     orders_count: int = 0
 
     def to_dict(self) -> dict:
         return {"mode": self.mode, "base_notional": self.base_notional, "book": self.book.to_dict(),
-                "last_order_slot": self.last_order_slot, "orders_count": self.orders_count}
+                "last_order_ts": self.last_order_ts, "orders_count": self.orders_count}
 
     @staticmethod
     def from_dict(d: dict) -> "BotState":
         return BotState(mode=d["mode"], base_notional=float(d["base_notional"]),
-                        book=PositionBook.from_dict(d["book"]), last_order_slot=int(d.get("last_order_slot", -1)),
+                        book=PositionBook.from_dict(d["book"]), last_order_ts=float(d.get("last_order_ts", 0.0)),
                         orders_count=int(d.get("orders_count", 0)))
