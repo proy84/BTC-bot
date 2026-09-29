@@ -1,26 +1,23 @@
-"""Flusso completo dell'orchestratore con un exchange finto (nessuna rete):
-apertura due gambe -> TP -> CLOSE ALL -> moltiplicatori -> TP -> nuova
-sequenza, piu' il regolamento spot (repay via conversione + acquisto BTC)."""
+"""Flusso completo di TrxBot con exchange finto (netting one-way) e orologio
+simulato: primo ordine all'avvio, un ordine al minuto, inversione, cambio di
+segno della posizione, riallineamento dopo una chiusura manuale."""
 
 import asyncio
 import dataclasses
-import json
-import time
 
 import pytest
 
 import main as bot_main
-from exchange import CoinBalance, FilledOrder, OpenPosition
-from strategy import LONG_LEG, MULTIPLY, NEW_SEQUENCE, SHORT_LEG, Decision, StrategyConfig
-
-SHORT_SYM, LONG_SYM = "BTC/USDT:USDT", "BTC/USDC:USDC"
+from exchange import FilledOrder, OpenPosition
+from strategy import StrategyConfig
 
 
 class FakeExchange:
+    """Nets orders into ONE position like Bybit one-way mode."""
+
     def __init__(self, cfg):
-        self.prices = {SHORT_SYM: 100_000.0, LONG_SYM: 100_000.0}
-        self.positions = {}
-        self.spot_calls = []
+        self.price = 0.30
+        self.side, self.qty, self.entry = None, 0.0, 0.0
         self.orders = []
 
     async def setup(self):
@@ -29,158 +26,136 @@ class FakeExchange:
     async def close(self):
         pass
 
-    async def fetch_last_prices(self, symbols):
-        return {s: self.prices[s] for s in symbols}
+    async def fetch_last_price(self):
+        return self.price
 
-    def min_order_qty(self, symbol):
-        return 0.001
+    def min_order_qty(self):
+        return 1.0
 
-    def qty_step(self, symbol):
-        return 0.001
+    def min_order_notional(self):
+        return 5.0
+
+    def qty_step(self):
+        return 1.0
 
     async def fetch_total_equity(self):
-        return 3330.0
+        return 3300.0
 
-    async def fetch_realized_funding(self, symbol, since_ms=None, limit=50):
+    async def fetch_realized_funding(self, symbol=None, since_ms=None, limit=50):
         return []
 
-    async def fetch_coin_balances(self):
-        return {"USDC": CoinBalance("USDC", 0.0, 0.0, 0.0)}
+    async def fetch_position(self):
+        return None if self.qty <= 0 else OpenPosition(self.side, self.qty, self.entry, 0.0)
 
-    async def fetch_open_positions(self):
-        return {s: OpenPosition(s, p[0], p[1], p[2], self.prices[s], 0.0) for s, p in self.positions.items()}
+    async def place_market_order(self, side, qty):
+        d = "long" if side == "buy" else "short"
+        if self.qty <= 0:
+            self.side, self.qty, self.entry = d, qty, self.price
+        elif d == self.side:
+            self.entry = (self.entry * self.qty + self.price * qty) / (self.qty + qty)
+            self.qty += qty
+        elif qty < self.qty:
+            self.qty -= qty
+        elif qty == self.qty:
+            self.side, self.qty, self.entry = None, 0.0, 0.0
+        else:
+            self.side, self.qty, self.entry = d, qty - self.qty, self.price
+        self.orders.append((side, qty, self.price))
+        return FilledOrder(str(len(self.orders)), side, self.price, qty, self.price * qty, None, 0)
 
-    def _fill(self, symbol, side, qty, price):
-        self.orders.append((symbol, side, qty, price))
-        return FilledOrder(str(len(self.orders)), symbol, side, price, qty, price * qty, None,
-                           int(time.time() * 1000))
 
-    async def open_position_market(self, symbol, side, qty):
-        price = self.prices[symbol]
-        self.positions[symbol] = (side, qty, price)
-        return self._fill(symbol, "buy" if side == "long" else "sell", qty, price)
+class Clock:
+    def __init__(self, t):
+        self.t = t
 
-    async def close_position_market(self, symbol):
-        side, qty, _ = self.positions.pop(symbol)
-        return self._fill(symbol, "buy" if side == "short" else "sell", qty, self.prices[symbol])
-
-    async def spot_market_buy_with_cost(self, symbol, cost):
-        self.spot_calls.append(("buy", symbol, cost))
-        return FilledOrder("s", symbol, "buy", 1.0, cost, cost, None, 0)
-
-    async def spot_market_sell(self, symbol, qty):
-        self.spot_calls.append(("sell", symbol, qty))
-        return FilledOrder("s", symbol, "sell", 1.0, qty, qty, None, 0)
-
-    async def repay_via_endpoint(self, coin, amount):
-        return False
+    def __call__(self):
+        return self.t
 
 
 @pytest.fixture
 def bot(tmp_path, monkeypatch):
     monkeypatch.setattr(bot_main, "ExchangeClient", FakeExchange)
     cfg = dataclasses.replace(
-        StrategyConfig.load("config.json"),
-        notifier_enabled=False, use_testnet=True, take_profit_net_pct=0.20,
-        trade_history_path=str(tmp_path / "hist.json"),
-        state_export_path=str(tmp_path / "live.json"),
+        StrategyConfig.load("config.json"), notifier_enabled=False, use_testnet=True,
+        trade_history_path=str(tmp_path / "hist.json"), state_export_path=str(tmp_path / "live.json"),
         runtime_state_path=str(tmp_path / "state.json"),
     )
-    return bot_main.BtcBot(cfg)
+    return bot_main.TrxBot(cfg, clock=Clock(600.5))  # 10:00.5 into minute slot 10
 
 
-def set_price(bot, p):
-    bot.exchange.prices = {SHORT_SYM: p, LONG_SYM: p}
+def test_full_flow(bot):
+    ex = bot.exchange
 
-
-def test_full_flow(bot, tmp_path):
     async def run():
         await bot._bootstrap()
-        # 1% of 3330 = 33.3 < exchange minimum 0.001 BTC x 100000 = 100 -> base 100
-        assert bot.seq.notionals == {SHORT_LEG: 100.0, LONG_LEG: 100.0}
+        # 1% of 3300 = 33 USDC -> 110 TRX at 0.30, first SHORT fired immediately
+        assert bot.state.base_notional == pytest.approx(33.0)
+        assert ex.orders == [("sell", 110.0, 0.30)]
+        assert bot.state.mode == "short"
 
-        await bot._tick()
-        assert set(bot.exchange.positions) == {SHORT_SYM, LONG_SYM}
-        assert bot.exchange.positions[SHORT_SYM][0] == "short"
-        assert bot.exchange.positions[LONG_SYM][0] == "long"
+        await bot._tick()                      # same minute: no new order
+        assert len(ex.orders) == 1
 
-        set_price(bot, 100_200.0)  # long net two-leg = 0.2 - ~0.22 < 0.2 -> no TP
+        bot.now.t = 661.5                      # next minute, 1.5s past the boundary
         await bot._tick()
-        assert bot.seq.cycle_id == 1 and len(bot.legs) == 2
+        assert ex.orders[-1][0] == "sell" and bot.state.book.qty == 220
 
-        # Cycle 1: TP long -> sequence in loss -> multipliers 150S / 200L
-        set_price(bot, 100_500.0)
+        bot.now.t = 720.5                      # before ORDER_OFFSET_SEC: waits
         await bot._tick()
-        c1 = bot.analytics.cycles[-1]
-        assert c1.tp_leg == LONG_LEG and c1.decision == MULTIPLY
-        assert c1.net_by_coin["USDC"] > 0 > c1.net_by_coin["USDT"]
-        assert bot.seq.step == 1 and bot.seq.cycle_id == 2
-        assert bot.seq.notionals == pytest.approx({SHORT_LEG: 150.0, LONG_LEG: 200.0})
-        # reopened immediately: 150/100500 -> 0.001, 200/100500 -> 0.002
-        assert bot.exchange.positions[SHORT_SYM][1] == pytest.approx(0.001)
-        assert bot.exchange.positions[LONG_SYM][1] == pytest.approx(0.002)
-        saved = json.loads((tmp_path / "state.json").read_text())
-        assert saved["step"] == 1 and saved["notionals"]["long"] == pytest.approx(200.0)
+        assert len(ex.orders) == 2
 
-        # Cycle 2: TP long again, small move -> sequence slightly positive but the
-        # USDC profit cannot repay USDT AND leave 5 for BTC -> multipliers again
-        set_price(bot, 101_100.0)
+        # price drops > 0.5% below the net break-even -> reversal to LONG
+        ex.price = 0.297
+        bot.now.t = 721.5
         await bot._tick()
-        c2 = bot.analytics.cycles[-1]
-        assert c2.tp_leg == LONG_LEG and c2.decision == MULTIPLY
-        assert bot.exchange.spot_calls == []
-        assert bot.seq.step == 2
-        assert bot.seq.notionals == pytest.approx({SHORT_LEG: 225.0, LONG_LEG: 400.0})
+        assert bot.state.mode == "long"
+        assert ex.orders[-1][0] == "buy"       # this minute's order already fires long
+        assert bot.state.book.side == "short" and bot.state.book.qty == 220 - 111
+        assert bot.state.book.realized_gross > 0
 
-        # Cycle 3: big move up -> USDC repays the USDT loss and has >= 5 left for BTC
-        set_price(bot, 115_000.0)
+        # two more minutes of buys: 109 -> flat is crossed, position becomes LONG
+        for t in (781.5, 841.5):
+            bot.now.t = t
+            await bot._tick()
+        assert bot.state.book.side == "long"
+        assert len(bot.analytics.h.episodes) == 1 and bot.analytics.h.episodes[0].side == "short"
+        assert bot.analytics.h.episodes[0].net > 0
+
+        # long in profit past +0.5% -> reversal back to SHORT
+        ex.price = 0.30
+        bot.now.t = 842.5
         await bot._tick()
-        c3 = bot.analytics.cycles[-1]
-        assert c3.decision == NEW_SEQUENCE
-        seq_net = c3.sequence_net_by_coin
-        assert seq_net["USDC"] > 0 > seq_net["USDT"]
-        (k1, sym1, amt1), (k2, sym2, amt2) = bot.exchange.spot_calls
-        assert (k1, sym1) == ("sell", "USDC/USDT") and amt1 == pytest.approx(-seq_net["USDT"])
-        assert (k2, sym2) == ("buy", "BTC/USDC") and amt2 == pytest.approx(sum(seq_net.values()))
-        assert amt2 >= 5.0
-        assert bot.seq.sequence_id == 2 and bot.seq.step == 0
-        assert bot.seq.notionals[SHORT_LEG] == bot.seq.notionals[LONG_LEG]
-        assert set(bot.exchange.positions) == {SHORT_SYM, LONG_SYM}
+        assert bot.state.mode == "short"
+        assert len(bot.analytics.h.reversals) == 2
 
     asyncio.run(run())
 
 
-def test_spot_settlement_usdt_winner(bot):
-    d = Decision(action=NEW_SEQUENCE, next_notionals={}, winner_coin="USDT", loser_coin="USDC",
-                 repay_amount=12.0, btc_buy_amount=18.0)
-    actions = asyncio.run(bot._spot_settlement(d))
-    assert bot.exchange.spot_calls == [("buy", "USDC/USDT", 12.0), ("buy", "BTC/USDT", 18.0)]
-    assert len(actions) == 2
+def test_manual_close_is_detected_and_resynced(bot):
+    ex = bot.exchange
 
-
-def test_spot_settlement_usdc_winner(bot):
-    d = Decision(action=NEW_SEQUENCE, next_notionals={}, winner_coin="USDC", loser_coin="USDT",
-                 repay_amount=7.0, btc_buy_amount=20.0)
-    asyncio.run(bot._spot_settlement(d))
-    assert bot.exchange.spot_calls == [("sell", "USDC/USDT", 7.0), ("buy", "BTC/USDC", 20.0)]
-
-
-def test_restart_resumes_sequence(bot, tmp_path):
     async def run():
         await bot._bootstrap()
-        bot.seq.step, bot.seq.notionals = 3, {SHORT_LEG: 450.0, LONG_LEG: 600.0}
-        bot._save_runtime_state()
-        bot2 = bot_main.BtcBot(bot.cfg)
-        bot2.exchange.positions = {SHORT_SYM: ("short", 0.005, 100_000.0), LONG_SYM: ("long", 0.006, 100_000.0)}
+        ex.side, ex.qty, ex.entry = None, 0.0, 0.0   # closed by hand on Bybit
+        await bot._tick()
+        assert bot.state.book.is_flat and bot.state.book.episode_id == 2
+        bot.now.t = 661.5
+        await bot._tick()                            # keeps firing in the active direction
+        assert bot.state.book.side == "short" and bot.state.book.qty == 110
+
+    asyncio.run(run())
+
+
+def test_restart_resumes_state(bot, tmp_path):
+    async def run():
+        await bot._bootstrap()
+        bot.state.mode = "long"
+        bot._save_state()
+        bot2 = bot_main.TrxBot(bot.cfg, clock=Clock(605.0))
+        bot2.exchange.side, bot2.exchange.qty, bot2.exchange.entry = "short", 110.0, 0.30
         await bot2._bootstrap()
-        assert bot2.seq.step == 3 and bot2.seq.notionals[LONG_LEG] == 600.0
-        assert set(bot2.legs) == {SHORT_LEG, LONG_LEG}
-        assert bot2.legs[LONG_LEG].qty == pytest.approx(0.006)
+        assert bot2.state.mode == "long" and bot2.state.base_notional == pytest.approx(33.0)
+        assert bot2.exchange.orders == []            # no extra opening order on restart
+        assert bot2.state.book.qty == 110
 
     asyncio.run(run())
-
-
-def test_wrong_side_position_refuses_to_start(bot):
-    bot.exchange.positions = {SHORT_SYM: ("long", 0.001, 100_000.0)}
-    with pytest.raises(RuntimeError):
-        asyncio.run(bot._bootstrap())
