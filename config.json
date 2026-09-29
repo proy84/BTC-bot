@@ -29,7 +29,7 @@
   "margin_mode": "cross",
 
   "_comment_take_profit": "Una gamba fa TP quando il suo PnL lordo, meno le fee (apertura + chiusura stimata) di ENTRAMBE le gambe, piu' il funding realizzato di ENTRAMBE, e' >= take_profit_net_pct% del notional della gamba stessa. Al TP: CLOSE ALL.",
-  "take_profit_net_pct": 0.50,
+  "take_profit_net_pct": 0.20,
 
   "fees": {
     "taker_rate": 0.00055,

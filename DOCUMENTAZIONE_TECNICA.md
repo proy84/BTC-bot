@@ -66,7 +66,7 @@ netto_X = PnL_lordo_X
         − fee chiusura stimate ai prezzi correnti (short + long)
         + funding realizzato (short + long)
 
-TP su X  ⇔  netto_X ≥ take_profit_net_pct% × notional_X      (attuale 0,50%)
+TP su X  ⇔  netto_X ≥ take_profit_net_pct% × notional_X      (attuale 0,20%)
 ```
 
 La gamba che fa TP paga **l'intero giro** di entrambe le posizioni, non solo le proprie fee. USDT e USDC sono sommati 1:1.
@@ -127,7 +127,7 @@ Al riavvio:
 | `legs.short/long` | vedi tabella iniziale | simbolo, lato, moneta di regolamento, coppia spot BTC |
 | `leverage` | 125 | leva su entrambe le gambe |
 | `margin_mode` | `cross` | |
-| `take_profit_net_pct` | 0.50 | soglia TP netto su due gambe, % del notional della gamba |
+| `take_profit_net_pct` | 0.20 | soglia TP netto su due gambe, % del notional della gamba |
 | `fees.taker_rate` / `maker_rate` | 0.00055 / 0.0002 | per stime (le fee reali vengono dai fill) |
 | `equity_based_sizing.enabled` / `percentage` | true / 1.0 | base notional = % dell'equity totale |
 | `base_notional_usd` | 1.0 | ripiego se la lettura equity fallisce |
