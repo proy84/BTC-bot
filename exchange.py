@@ -216,15 +216,22 @@ class ExchangeClient:
     async def fetch_realized_funding(self, symbol: str, since_ms: Optional[int] = None,
                                      limit: int = 50) -> List[Tuple[str, int, float]]:
         """REALIZED funding settlements for `symbol` from the exchange's own
-        ledger -- (id, timestamp_ms, cashflow in the settle coin). Bybit
-        settles every 8h; a short-lived position correctly accrues ~0."""
+        ledger -- (id, timestamp_ms, cashflow in the settle coin, positive =
+        RECEIVED). Bybit settles every 8h; a short-lived position correctly
+        accrues ~0.
+
+        Sign: ccxt's `amount` here is Bybit's `execFee` for the funding
+        execution, i.e. a FEE -- positive when the position PAID funding.
+        Confirmed on Demo 2026-09-29 08:00 UTC (funding rate +0.0028%): the
+        SHORT reported execFee -0.0118 (received), the LONG +0.0675 (paid).
+        So the cashflow is `-amount`."""
         raw = await self._retry(self._private.fetch_funding_history, symbol, since_ms, limit)
         result: List[Tuple[str, int, float]] = []
         for entry in raw:
             eid, ts, amount = entry.get("id"), entry.get("timestamp"), entry.get("amount")
             if eid is None or ts is None or amount is None:
                 continue
-            result.append((str(eid), int(ts), float(amount)))
+            result.append((str(eid), int(ts), -float(amount)))
         return result
 
     # -- positions / perpetual orders ---------------------------------------
