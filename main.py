@@ -44,7 +44,7 @@ from strategy import (
 
 logger = logging.getLogger("bot.main")
 
-BOT_VERSION = "3.0"
+BOT_VERSION = "3.1"
 CONFIG_PATH = "config.json"
 STOP_SIGNAL_PATH = Path("STOP")
 MIN_ORDER_MARGIN = 1.01         # keep each order >= 1% above the exchange minimum value (price drift)
@@ -75,8 +75,8 @@ class TrxBot:
     # -- lifecycle -----------------------------------------------------------
 
     async def start(self) -> None:
-        logger.info("[INFO] Avvio %s v%s -- %s leva %dx one-way, timeframe %s, inversione a %.2f%% oltre il "
-                    "breakeven netto, %s", BOT_NAME, BOT_VERSION, self.cfg.symbol, self.cfg.leverage,
+        logger.info("[INFO] Avvio %s v%s -- %s leva %dx one-way, timeframe %s, inversione a ±%.2f%% dal "
+                    "breakeven (prezzo medio, senza fee), %s", BOT_NAME, BOT_VERSION, self.cfg.symbol, self.cfg.leverage,
                     self.cfg.timeframe, self.cfg.reversal_pct, "DEMO" if self.cfg.use_testnet else "PRODUZIONE")
         await self.exchange.setup()
         await self._bootstrap()
