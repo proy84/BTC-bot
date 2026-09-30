@@ -1,79 +1,81 @@
-"""Breakeven netto (fee + funding + chiusura stimata) e regola di inversione a 0,5%."""
+"""Breakeven = prezzo medio d'ingresso (SENZA fee) e regola di inversione
+simmetrica a 0,5%: sotto BE-0,5% si sparano LONG, sopra BE+0,5% SHORT."""
 
 import pytest
 
-from fees import gross_pnl
-from strategy import PositionBook, breakeven_net, qty_for_notional, reversal_signal
+from strategy import PositionBook, breakeven, qty_for_notional, reversal_signal, reversal_thresholds
 
-F = 0.00055
 PCT = 0.5
 
 
-def total_net_if_closed_at(b: PositionBook, p: float) -> float:
-    return b.realized_net + gross_pnl(b.side, b.avg_entry, p, b.qty) - F * p * b.qty
-
-
-@pytest.mark.parametrize("side", ["sell", "buy"])
-def test_breakeven_closes_episode_at_exactly_zero(side):
+def short_book(price=2700.0, qty=0.02, fee=0.03):
     b = PositionBook()
-    b.apply_fill(side, 300, 0.33, F * 300 * 0.33)
-    b.apply_fill(side, 300, 0.34, F * 300 * 0.34)
-    b.funding = -0.004
-    be = breakeven_net(b, F)
-    assert total_net_if_closed_at(b, be) == pytest.approx(0.0, abs=1e-12)
+    b.apply_fill("sell", qty, price, fee)
+    return b
 
 
-def test_breakeven_includes_realized_part_of_a_reduced_position():
+def test_breakeven_is_plain_average_entry_without_fees():
     b = PositionBook()
-    b.apply_fill("sell", 300, 0.34, F * 300 * 0.34)
-    b.apply_fill("buy", 100, 0.33, F * 100 * 0.33)  # realizes +1.0 on 100 TRX
-    be = breakeven_net(b, F)
-    assert be > b.avg_entry * (1 - 2 * F)            # realized profit pushes the short BE UP
-    assert total_net_if_closed_at(b, be) == pytest.approx(0.0, abs=1e-12)
+    b.apply_fill("sell", 0.01, 2700.0, 5.0)     # huge fee on purpose
+    b.apply_fill("sell", 0.01, 2720.0, 5.0)
+    b.funding = -3.0
+    assert breakeven(b) == pytest.approx(2710.0)   # fees and funding ignored
+    assert breakeven(PositionBook()) is None
 
 
-def test_short_breakeven_is_below_entry_long_above():
-    s, l = PositionBook(), PositionBook()
-    s.apply_fill("sell", 100, 0.30, F * 30)
-    l.apply_fill("buy", 100, 0.30, F * 30)
-    assert breakeven_net(s, F) < 0.30 < breakeven_net(l, F)
+def test_breakeven_unchanged_by_partial_reduction():
+    b = short_book(2700.0, 0.03)
+    b.apply_fill("buy", 0.01, 2650.0, 0.01)
+    assert breakeven(b) == pytest.approx(2700.0)
 
 
-def test_short_reverses_to_long_only_past_half_percent():
+def test_thresholds():
+    long_below, short_above = reversal_thresholds(short_book(2700.0), PCT)
+    assert long_below == pytest.approx(2686.5)
+    assert short_above == pytest.approx(2713.5)
+
+
+def test_short_below_breakeven_switches_to_long():
+    b = short_book(2700.0)
+    assert reversal_signal("short", b, 2686.6, PCT) is None
+    assert reversal_signal("short", b, 2686.5, PCT) == "long"
+    assert reversal_signal("long", b, 2686.5, PCT) is None       # already firing long
+
+
+def test_price_above_breakeven_switches_to_short_whatever_the_side():
+    # long position in profit
     b = PositionBook()
-    b.apply_fill("sell", 100, 0.30, F * 30)
-    trigger = breakeven_net(b, F) * (1 - PCT / 100)
-    assert reversal_signal("short", b, trigger + 1e-6, PCT, F) is None
-    assert reversal_signal("short", b, trigger, PCT, F) == "long"
-    assert reversal_signal("long", b, trigger, PCT, F) is None  # already firing long
+    b.apply_fill("buy", 0.02, 2700.0, 0.03)
+    assert reversal_signal("long", b, 2713.4, PCT) is None
+    assert reversal_signal("long", b, 2713.5, PCT) == "short"
+    # short position still being reduced by longs, price back ABOVE its BE +0.5% -> back to short
+    s = short_book(2700.0)
+    assert reversal_signal("long", s, 2713.5, PCT) == "short"
 
 
-def test_long_reverses_to_short_only_past_half_percent():
+def test_price_below_breakeven_with_long_position_keeps_long():
     b = PositionBook()
-    b.apply_fill("buy", 100, 0.30, F * 30)
-    trigger = breakeven_net(b, F) * (1 + PCT / 100)
-    assert reversal_signal("long", b, trigger - 1e-6, PCT, F) is None
-    assert reversal_signal("long", b, trigger, PCT, F) == "short"
-    assert reversal_signal("short", b, trigger, PCT, F) is None
+    b.apply_fill("buy", 0.02, 2700.0, 0.03)
+    assert reversal_signal("long", b, 2600.0, PCT) is None       # keeps buying below BE
+    assert reversal_signal("short", b, 2600.0, PCT) == "long"
 
 
-def test_losing_position_never_reverses():
-    b = PositionBook()
-    b.apply_fill("sell", 100, 0.30, F * 30)
-    assert reversal_signal("short", b, 0.40, PCT, F) is None     # short deep in loss: keeps selling
-    assert reversal_signal("short", PositionBook(), 0.30, PCT, F) is None  # flat
+def test_between_thresholds_keeps_direction():
+    b = short_book(2700.0)
+    for p in (2690.0, 2700.0, 2710.0):
+        assert reversal_signal("short", b, p, PCT) is None
+        assert reversal_signal("long", b, p, PCT) is None
+    assert reversal_signal("short", PositionBook(), 2000.0, PCT) is None   # flat
 
 
-def test_qty_rounding_trx():
-    assert qty_for_notional(33.3, 0.3347, qty_step=1, min_qty=1) == 99   # 99.49 -> 99
-    assert qty_for_notional(33.5, 0.3347, qty_step=1, min_qty=1) == 100  # 100.09 -> 100
-    assert qty_for_notional(0.1, 0.3347, qty_step=1, min_qty=1) == 1
+def test_qty_eth_minimum():
+    # ETHUSDT: step 0.01, min qty 0.01 (~27 USDT) -> the minimum order is 0.01 ETH
+    assert qty_for_notional(27.4, 2737.0, 0.01, 0.01, min_notional=5.05) == pytest.approx(0.01)
+    assert qty_for_notional(5.0, 2737.0, 0.01, 0.01, min_notional=5.05) == pytest.approx(0.01)
 
 
 def test_qty_never_below_min_order_value():
-    # 5 USDC at 0.3343: nearest step would be 15 TRX = 5.01, below the 5.05 target -> round UP to 16
+    # 5 at 0.3343 with step 1: nearest step 15 = 5.01 < 5.05 -> round UP to 16
     assert qty_for_notional(5.0, 0.3343, 1, 1, min_notional=5.05) == 16
-    # 5 USDC at 0.30: 17 TRX = 5.10 already above -> unchanged
     assert qty_for_notional(5.0, 0.30, 1, 1, min_notional=5.05) == 17
-    # rounding DOWN below the minimum (14.4 -> 14 TRX = 4.82) is corrected up
     assert qty_for_notional(5.0, 0.3472, 1, 1, min_notional=5.0) * 0.3472 >= 5.0

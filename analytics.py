@@ -1,7 +1,7 @@
 """
 analytics.py
 
-Persists TRX bot activity to `trx_bot_history.json`: every filled order,
+Persists the bot's activity to its history file: every filled order,
 every direction reversal and every closed position episode, plus a running
 summary (orders, realized net, fees, funding, largest position reached).
 """
@@ -32,7 +32,7 @@ class ReversalRecord:
     from_mode: str
     to_mode: str
     price: float
-    breakeven_net: float
+    breakeven: float
     position_side: str
     position_qty: float
 

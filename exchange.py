@@ -1,8 +1,8 @@
 """
 exchange.py
 
-CCXT gateway to Bybit V5 for TRX bot: one linear perpetual (TRX/USDC =
-Bybit TRXPERP, settles in USDC), ONE-WAY position mode.
+CCXT gateway to Bybit V5 for the accumulation bot: one linear perpetual
+(currently ETH/USDT), ONE-WAY position mode.
 
 IMPORTANT (discovered empirically): Bybit's Demo Trading host
 (`https://api-demo.bybit.com`) only supports a narrow set of AUTHENTICATED
@@ -40,7 +40,7 @@ from ccxt.base.errors import ExchangeError, NetworkError  # type: ignore[import-
 
 from strategy import BOT_NAME, StrategyConfig
 
-logger = logging.getLogger("trx_bot.exchange")
+logger = logging.getLogger("bot.exchange")
 
 BYBIT_DEMO_BASE_URL = "https://api-demo.bybit.com"
 
@@ -155,7 +155,7 @@ class ExchangeClient:
         return float(ticker.get("last") or ticker.get("close"))
 
     def min_order_qty(self) -> float:
-        """Exchange minimum qty (1 TRX on TRXPERP). Never raises: 0.0 on lookup failure."""
+        """Exchange minimum qty (0.01 ETH on ETHUSDT). Never raises: 0.0 on lookup failure."""
         try:
             market = self._public.market(self.symbol)
             return float((market.get("limits") or {}).get("amount", {}).get("min") or 0.0)
@@ -164,7 +164,7 @@ class ExchangeClient:
             return 0.0
 
     def min_order_notional(self) -> float:
-        """Exchange minimum order value (5 USDC on TRXPERP). 0.0 on lookup failure."""
+        """Exchange minimum order value (5 USDT on ETHUSDT). 0.0 on lookup failure."""
         try:
             market = self._public.market(self.symbol)
             unified = (market.get("limits") or {}).get("cost", {}).get("min")
@@ -179,7 +179,7 @@ class ExchangeClient:
             return 0.0
 
     def qty_step(self) -> float:
-        """Exchange qty increment (1 TRX on TRXPERP). 0.0 on lookup failure."""
+        """Exchange qty increment (0.01 ETH on ETHUSDT). 0.0 on lookup failure."""
         try:
             market = self._public.market(self.symbol)
             return float((market.get("precision") or {}).get("amount") or 0.0)

@@ -1,16 +1,17 @@
 """
 main.py
 
-TRX bot -- one-way accumulation bot on TRX/USDC perpetual (Bybit V5, Demo
-Trading by default). Strategy rules: see `strategy.py`.
+Accumulation bot (ETH bot) -- one-way, one linear perpetual (currently
+ETH/USDT 150x; Bybit V5, Demo Trading by default). Strategy rules: see `strategy.py`.
 
 Loop (every `polling.tick_poll_interval_sec`), always under `_position_lock`:
   1. Read the last price and reconcile the local position book with Bybit's
      real net position (a manual close/change on Bybit is detected here and
      the book is resynced instead of trading on a stale picture).
   2. Poll realized funding (every `funding_poll_interval_sec`).
-  3. Reversal check: net position `reversal_pct`% in profit past its net
-     break-even -> the active direction flips (`strategy.reversal_signal`).
+  3. Reversal check: price `reversal_pct`% below the break-even (average
+     entry, no fees) -> fire LONG; `reversal_pct`% above -> fire SHORT
+     (`strategy.reversal_signal`).
   4. When `timeframe_sec` (60s) have passed since the previous order, fire
      one market order of `base_notional` in the active direction (never below
      the exchange minimum order value). At first start the first order fires
@@ -38,10 +39,10 @@ from data_exporter import DataExporter
 from exchange import ExchangeClient
 from strategy import (
     BOT_NAME, BotState, ClosedEpisode, PositionBook, StrategyConfig, base_notional_from_equity,
-    breakeven_net, order_side_for, qty_for_notional, reversal_signal,
+    breakeven, order_side_for, qty_for_notional, reversal_signal, reversal_thresholds,
 )
 
-logger = logging.getLogger("trx_bot.main")
+logger = logging.getLogger("bot.main")
 
 BOT_VERSION = "3.0"
 CONFIG_PATH = "config.json"
@@ -80,7 +81,7 @@ class TrxBot:
         await self.exchange.setup()
         await self._bootstrap()
         self._notify("Avvio", [f"Direzione attiva: <b>{self.state.mode.upper()}</b>",
-                               f"Importo per ordine: {self.state.base_notional:.2f} USDC"])
+                               f"Importo per ordine: {self.state.base_notional:.2f} {self.cfg.settle_coin}"])
         await self._tick_loop()
 
     async def stop(self) -> None:
@@ -100,18 +101,19 @@ class TrxBot:
             pos = await self.exchange.fetch_position()
             if pos is not None:
                 book = self._book_from_exchange(pos, episode_id=1)
-                logger.warning("Posizione esistente su %s adottata: %s qty=%.0f entry=%.5f.",
+                logger.warning("Posizione esistente su %s adottata: %s qty=%g entry=%.5f.",
                                self.cfg.symbol, pos.side.upper(), pos.qty, pos.entry_price)
             self.state = BotState(mode=self.cfg.initial_direction, base_notional=base, book=book)
-            logger.info("Primo avvio: direzione %s, importo per ordine %.2f USDC.", self.state.mode.upper(), base)
+            logger.info("Primo avvio: direzione %s, importo per ordine %.2f %s.", self.state.mode.upper(), base,
+                        self.cfg.settle_coin)
             await self._fire_order(price)  # "all'avvio apre la posizione"
         else:
             price = await self.exchange.fetch_last_price()
             base = await self._compute_base_notional(price)
             if not self.cfg.equity_based_sizing_enabled and abs(base - self.state.base_notional) > 1e-9:
                 # fixed-size mode (e.g. exchange minimum): a config change applies on restart
-                logger.info("Importo per ordine aggiornato da config: %.2f -> %.2f USDC.",
-                            self.state.base_notional, base)
+                logger.info("Importo per ordine aggiornato da config: %.2f -> %.2f %s.",
+                            self.state.base_notional, base, self.cfg.settle_coin)
                 self.state.base_notional = base
         self._save_state()
 
@@ -120,7 +122,7 @@ class TrxBot:
             return None
         try:
             state = BotState.from_dict(json.loads(self.runtime_state_path.read_text(encoding="utf-8")))
-            logger.info("Stato ripreso: direzione %s, importo %.2f, posizione %s qty=%.0f, ordini %d.",
+            logger.info("Stato ripreso: direzione %s, importo %.2f, posizione %s qty=%g, ordini %d.",
                         state.mode.upper(), state.base_notional, (state.book.side or "flat").upper(),
                         state.book.qty, state.orders_count)
             return state
@@ -148,8 +150,8 @@ class TrxBot:
                 logger.exception("Lettura equity fallita: uso base_notional_usd=%.2f.", self.cfg.base_notional_usd)
         base = base_notional_from_equity(equity, self.cfg.equity_based_sizing_percentage,
                                          self.cfg.base_notional_usd, min_value)
-        logger.info("Importo per ordine: %.2f USDC (equity %.2f x %.2f%%, minimo exchange %.2f).",
-                    base, equity, self.cfg.equity_based_sizing_percentage, min_value)
+        logger.info("Importo per ordine: %.2f %s (equity %.2f x %.2f%%, minimo exchange %.2f).",
+                    base, self.cfg.settle_coin, equity, self.cfg.equity_based_sizing_percentage, min_value)
         return base
 
     def _book_from_exchange(self, pos, episode_id: int) -> PositionBook:
@@ -192,7 +194,7 @@ class TrxBot:
         try:
             filled = await self.exchange.place_market_order(side, qty)
         except Exception:
-            logger.exception("Ordine %s %s qty=%.0f fallito: riprovo al prossimo minuto.",
+            logger.exception("Ordine %s %s qty=%g fallito: riprovo al prossimo minuto.",
                              side.upper(), self.cfg.symbol, qty)
             return
         if filled.qty <= 0 or filled.price <= 0:
@@ -203,10 +205,10 @@ class TrxBot:
         st.orders_count += 1
         self.last_price = filled.price
         book = st.book
-        be = breakeven_net(book, self.cfg.taker_rate)
-        logger.info("Ordine #%d %s %.0f TRX @ %.5f (%.2f USDC, fee %.4f) -> posizione %s %.0f, BE netto %s",
-                    st.orders_count, side.upper(), filled.qty, filled.price, filled.notional, fee,
-                    (book.side or "flat").upper(), book.qty, f"{be:.5f}" if be else "-")
+        be = breakeven(book)
+        logger.info("Ordine #%d %s %g %s @ %.5f (%.2f %s, fee %.4f) -> posizione %s %g, BE %s",
+                    st.orders_count, side.upper(), filled.qty, self.cfg.base_asset, filled.price, filled.notional,
+                    self.cfg.settle_coin, fee, (book.side or "flat").upper(), book.qty, f"{be:.5f}" if be else "-")
         try:
             self.analytics.record_order(OrderRecord(
                 timestamp_ms=filled.timestamp_ms, mode=st.mode, side=side, qty=filled.qty, price=filled.price,
@@ -220,33 +222,34 @@ class TrxBot:
         if price is None:
             return
         st = self.state
-        new_mode = reversal_signal(st.mode, st.book, price, self.cfg.reversal_pct, self.cfg.taker_rate)
+        new_mode = reversal_signal(st.mode, st.book, price, self.cfg.reversal_pct)
         if new_mode is None:
             return
-        be = breakeven_net(st.book, self.cfg.taker_rate)
-        logger.info("INVERSIONE %s -> %s: prezzo %.5f, posizione %s %.0f, BE netto %.5f (oltre il %.2f%%).",
+        be = breakeven(st.book)
+        logger.info("INVERSIONE %s -> %s: prezzo %.5f, posizione %s %g, BE %.5f (oltre il %.2f%%).",
                     st.mode.upper(), new_mode.upper(), price, st.book.side.upper(), st.book.qty, be,
                     self.cfg.reversal_pct)
         try:
             self.analytics.record_reversal(ReversalRecord(
                 timestamp_ms=int(self.now() * 1000), from_mode=st.mode, to_mode=new_mode, price=price,
-                breakeven_net=be, position_side=st.book.side, position_qty=st.book.qty))
+                breakeven=be, position_side=st.book.side, position_qty=st.book.qty))
         except Exception:
             logger.exception("Registrazione inversione nello storico fallita.")
         self._notify("Inversione", [f"{st.mode.upper()} → <b>{new_mode.upper()}</b> a {price:.5f}",
-                                    f"Posizione {st.book.side.upper()} {st.book.qty:.0f} TRX, BE netto {be:.5f}"])
+                                    f"Posizione {st.book.side.upper()} {st.book.qty:g} {self.cfg.base_asset}, BE {be:.5f}"])
         st.mode = new_mode
 
     def _on_episode_closed(self, ep: ClosedEpisode) -> None:
-        logger.info("Posizione %s (episodio #%d) chiusa: netto %.4f USDC (lordo %.4f, fee %.4f, funding %.4f).",
-                    ep.side.upper(), ep.episode_id, ep.net, ep.realized_gross, ep.fees, ep.funding)
+        logger.info("Posizione %s (episodio #%d) chiusa: netto %.4f %s (lordo %.4f, fee %.4f, funding %.4f).",
+                    ep.side.upper(), ep.episode_id, ep.net, self.cfg.settle_coin, ep.realized_gross, ep.fees,
+                    ep.funding)
         try:
             self.analytics.record_episode(EpisodeRecord(
                 timestamp_ms=int(self.now() * 1000), episode_id=ep.episode_id, side=ep.side,
                 realized_gross=ep.realized_gross, fees=ep.fees, funding=ep.funding, net=ep.net))
         except Exception:
             logger.exception("Registrazione episodio nello storico fallita.")
-        self._notify(f"Posizione {ep.side.upper()} chiusa", [f"Netto: <b>{ep.net:+.4f} USDC</b>"])
+        self._notify(f"Posizione {ep.side.upper()} chiusa", [f"Netto: <b>{ep.net:+.4f} {self.cfg.settle_coin}</b>"])
         self._funding_ids.clear()
         self._funding_since_ms = None
 
@@ -265,8 +268,8 @@ class TrxBot:
             return
         if pos is not None and not book.is_flat and pos.side == book.side and abs(pos.qty - book.qty) < step / 2:
             return
-        logger.warning("Posizione su Bybit (%s) diversa da quella del bot (%s %.0f): intervento esterno? "
-                       "Riallineo.", f"{pos.side.upper()} {pos.qty:.0f}" if pos else "FLAT",
+        logger.warning("Posizione su Bybit (%s) diversa da quella del bot (%s %g): intervento esterno? "
+                       "Riallineo.", f"{pos.side.upper()} {pos.qty:g}" if pos else "FLAT",
                        (book.side or "flat").upper(), book.qty)
         next_id = book.episode_id + 1
         self.state.book = self._book_from_exchange(pos, next_id) if pos else PositionBook(episode_id=next_id)
@@ -297,17 +300,14 @@ class TrxBot:
                 continue
             self._funding_ids.add(fid)
             self.state.book.funding += cashflow
-            logger.info("Funding realizzato: %+.6f USDC", cashflow)
+            logger.info("Funding realizzato: %+.6f %s", cashflow, self.cfg.settle_coin)
 
     # -- export / helpers ----------------------------------------------------
 
     def _export(self, price: float) -> None:
         st = self.state
-        be = breakeven_net(st.book, self.cfg.taker_rate)
-        trigger = None
-        if be is not None:
-            trigger = be * (1 - self.cfg.reversal_pct / 100) if st.book.side == "short" else \
-                be * (1 + self.cfg.reversal_pct / 100)
+        be = breakeven(st.book)
+        th = reversal_thresholds(st.book, self.cfg.reversal_pct)
         self.exporter.export({
             "timestamp_ms": int(self.now() * 1000),
             "bot": BOT_NAME,
@@ -318,8 +318,9 @@ class TrxBot:
             "base_notional": st.base_notional,
             "orders_count": st.orders_count,
             "position": st.book.to_dict(),
-            "breakeven_net": be,
-            "reversal_trigger_price": trigger,
+            "breakeven": be,
+            "long_below": th[0] if th else None,
+            "short_above": th[1] if th else None,
         })
 
     def _maybe_heartbeat(self, price: float) -> None:
@@ -328,11 +329,12 @@ class TrxBot:
             return
         self._last_heartbeat = now
         st = self.state
-        be = breakeven_net(st.book, self.cfg.taker_rate)
+        be = breakeven(st.book)
         dist = f"{(price / be - 1) * 100:+.3f}%" if be else "-"
-        logger.info("Stato: direzione %s | posizione %s %.0f TRX (%.2f USDC) | prezzo %.5f | BE netto %s (%s) | "
-                    "ordini %d", st.mode.upper(), (st.book.side or "flat").upper(), st.book.qty,
-                    st.book.notional, price, f"{be:.5f}" if be else "-", dist, st.orders_count)
+        logger.info("Stato: direzione %s | posizione %s %g %s (%.2f %s) | prezzo %.5f | BE %s (%s) | ordini %d",
+                    st.mode.upper(), (st.book.side or "flat").upper(), st.book.qty, self.cfg.base_asset,
+                    st.book.notional, self.cfg.settle_coin, price, f"{be:.5f}" if be else "-", dist,
+                    st.orders_count)
 
     def _notify(self, title: str, body: list) -> None:
         """Fire-and-forget Telegram message: local import, own try/except,
@@ -369,7 +371,7 @@ async def _run() -> None:
     # DEBUG only for the bot's own namespace (LOG_LEVEL=DEBUG): ccxt's own DEBUG
     # output would dump signed requests, API key header included.
     debug = os.environ.get("LOG_LEVEL", "").strip().upper() == "DEBUG"
-    logging.getLogger("trx_bot").setLevel(logging.DEBUG if debug else logging.INFO)
+    logging.getLogger("bot").setLevel(logging.DEBUG if debug else logging.INFO)
     cfg = StrategyConfig.load(CONFIG_PATH)
     bot = TrxBot(cfg)
     try:

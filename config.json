@@ -1,5 +1,5 @@
 {
-  "_comment": "TRX bot v3 -- accumulo one-way su TRX/USDC perpetual (Bybit TRXPERP). Chiavi API, USE_TESTNET e Telegram stanno SOLO in .env (vedi .env.example), mai qui.",
+  "_comment": "ETH bot -- accumulo one-way su ETH/USDT perpetual (Bybit ETHUSDT), leva 150x. Chiavi API, USE_TESTNET e Telegram stanno SOLO in .env (vedi .env.example), mai qui.",
 
   "exchange": {
     "id": "bybit",
@@ -10,15 +10,15 @@
     }
   },
 
-  "symbol": "TRX/USDC:USDC",
-  "leverage": 75,
+  "symbol": "ETH/USDT:USDT",
+  "leverage": 150,
   "margin_mode": "cross",
 
   "_comment_timeframe": "Il bot spara UN ordine a mercato di importo fisso nella direzione attiva ogni timeframe (1 minuto), contato dall'ordine PRECEDENTE (non allineato all'orologio). All'avvio il primo ordine parte subito.",
   "timeframe": "1m",
   "initial_direction": "short",
 
-  "_comment_reversal": "Modalita' one-way: una sola posizione netta. Quando la posizione netta e' reversal_pct% in profitto oltre il suo breakeven NETTO (prezzo medio + fee pagate + funding + fee di chiusura stimata), la direzione attiva si inverte: short in profitto -> si sparano long (che riducono lo short e poi lo girano), long in profitto -> si sparano short. Nessun TP e nessun limite per ora.",
+  "_comment_reversal": "Modalita' one-way: una sola posizione netta. Breakeven = prezzo MEDIO d'ingresso della posizione netta, SENZA fee e funding. Regola simmetrica sul prezzo: prezzo <= BE - reversal_pct% -> si sparano LONG ogni minuto; prezzo >= BE + reversal_pct% -> si sparano SHORT ogni minuto; in mezzo -> si continua nella direzione attuale. Gli ordini opposti alla posizione la riducono e, se la superano, la girano. Nessun TP e nessun limite per ora.",
   "reversal_pct": 0.5,
 
   "fees": {
@@ -26,7 +26,7 @@
     "maker_rate": 0.0002
   },
 
-  "_comment_sizing": "Importo di ogni ordine. Config attuale: equity_based_sizing disattivato e base_notional_usd = 0 -> ogni ordine al MINIMO consentito da Bybit (5 USDC su TRXPERP), con quantita' arrotondata per eccesso (+1% di margine) cosi' non scende mai sotto il minimo. base_notional_usd > 0 -> importo fisso (mai sotto il minimo). equity_based_sizing.enabled = true -> percentage% dell'equity letto al primo avvio.",
+  "_comment_sizing": "Importo di ogni ordine. Config attuale: equity_based_sizing disattivato e base_notional_usd = 0 -> ogni ordine al MINIMO consentito da Bybit (su ETHUSDT la qty minima 0.01 ETH, circa 27 USDT; ordine minimo 5 USDT), quantita' arrotondata per eccesso cosi' non scende mai sotto il minimo. base_notional_usd > 0 -> importo fisso (mai sotto il minimo). equity_based_sizing.enabled = true -> percentage% dell'equity letto al primo avvio.",
   "equity_based_sizing": {
     "enabled": false,
     "percentage": 1.0
@@ -43,8 +43,8 @@
   },
 
   "paths": {
-    "trade_history_path": "trx_bot_history.json",
-    "state_export_path": "trx_bot_live.json",
-    "runtime_state_path": "trx_bot_state.json"
+    "trade_history_path": "eth_bot_history.json",
+    "state_export_path": "eth_bot_live.json",
+    "runtime_state_path": "eth_bot_state.json"
   }
 }

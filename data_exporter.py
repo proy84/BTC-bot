@@ -1,9 +1,9 @@
 """
 data_exporter.py
 
-Writes a live snapshot of TRX bot (active direction, net position, net
-break-even, distance to reversal) plus the performance summary to
-`trx_bot_live.json` for a dashboard to poll. Every write is atomic.
+Writes a live snapshot of the bot (active direction, net position,
+break-even, reversal thresholds) plus the performance summary to the live
+state file for a dashboard to poll. Every write is atomic.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from typing import Union
 
 from analytics import AnalyticsEngine
 
-logger = logging.getLogger("trx_bot.data_exporter")
+logger = logging.getLogger("bot.data_exporter")
 
 
 class DataExporter:

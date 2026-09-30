@@ -1,7 +1,7 @@
 """
 notifier.py
 
-Optional, isolated Telegram notifications for TRX bot: startup, direction
+Optional, isolated Telegram notifications for the bot: startup, direction
 reversals and closed position episodes, each with account equity.
 
 FAIL-SAFE: every public coroutine runs its whole body under one try/except
@@ -22,7 +22,7 @@ from typing import Any, List, Optional
 
 from strategy import BOT_NAME
 
-logger = logging.getLogger("trx_bot.notifier")
+logger = logging.getLogger("bot.notifier")
 
 _TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 EUR_RATE_SYMBOL = "USDT/EUR"  # Bybit spot pair, no external FX API
@@ -70,7 +70,7 @@ async def _equity_lines(exchange_client: Any) -> List[str]:
     lines.append(line)
     try:
         balances = await exchange_client.fetch_coin_balances()
-        for coin in ("USDC", "USDT", "BTC"):
+        for coin in ("USDT", "USDC", "BTC", "ETH"):
             b = balances.get(coin)
             if b is None:
                 continue

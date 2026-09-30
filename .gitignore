@@ -13,3 +13,6 @@ __pycache__/
 /trx_bot_state.json
 /trx_bot_live.json
 /trx_bot_history.json
+/eth_bot_state.json
+/eth_bot_live.json
+/eth_bot_history.json

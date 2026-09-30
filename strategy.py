@@ -1,32 +1,31 @@
 """
 strategy.py
 
-Config and pure decision logic for TRX bot -- a one-way accumulation bot on
-the TRX/USDC perpetual (Bybit TRXPERP). No network/exchange dependency by
+Config and pure decision logic for the accumulation bot -- one-way, one
+linear perpetual (currently ETH/USDT, 150x). No network/exchange dependency by
 design: exchange I/O lives in `exchange.py`, orchestration in `main.py`.
 
 Rules:
   - At startup the bot opens a SHORT of `base notional`: the exchange minimum
-    order value (5 USDC on TRXPERP) with the current config
-    (`base_notional_usd` = 0, equity sizing off); otherwise a fixed amount or
-    a percentage of total equity.
+    order value with the current config (`base_notional_usd` = 0, equity
+    sizing off -- on ETHUSDT that is the 0.01 ETH minimum qty); otherwise a
+    fixed amount or a percentage of total equity.
   - Every timeframe (1m) -- counted from the PREVIOUS order, not aligned to
     the clock -- it fires one more market order of the same base notional in
     the ACTIVE DIRECTION (initially short).
   - One-way mode: there is a single NET position. Orders in the direction
     opposite to the position reduce it (and flip it if they exceed it).
-  - Reversal: when the net position is `reversal_pct`% IN PROFIT relative to
-    its NET break-even (average entry adjusted for every fee paid and funding
-    received/paid, plus the estimated closing fee), the active direction
-    becomes the opposite of the position:
-        net SHORT and price <= BE_net * (1 - reversal_pct/100) -> fire LONG
-        net LONG  and price >= BE_net * (1 + reversal_pct/100) -> fire SHORT
+  - Reversal, symmetric on price vs BREAK-EVEN = plain average entry of the
+    net position (fees and funding NOT included):
+        price <= BE * (1 - reversal_pct/100) -> fire LONG every minute
+        price >= BE * (1 + reversal_pct/100) -> fire SHORT every minute
+        in between                            -> keep the current direction
   - No take profit and no size limit for now: orders fire forever.
 
-Break-even is computed per POSITION EPISODE: an episode starts when the
-position opens from flat and ends when it returns to flat (or crosses zero,
-which closes it and opens a new one on the other side). Realized PnL of
-partial reductions, fees and funding inside the episode are all included.
+A POSITION EPISODE starts when the position opens from flat and ends when it
+returns to flat (or crosses zero, which closes it and opens a new one on the
+other side at the fill price -- so the new side's break-even starts fresh).
+Realized PnL, fees and funding of each episode are tracked for the history.
 """
 
 from __future__ import annotations
@@ -46,7 +45,7 @@ from fees import LONG, SHORT, gross_pnl
 # into the process environment. No-op if the file doesn't exist.
 load_dotenv()
 
-BOT_NAME = "TRX bot"
+BOT_NAME = "ETH bot"
 QTY_EPS = 1e-9
 
 
@@ -95,6 +94,14 @@ class StrategyConfig:
     api_key: str
     api_secret: str
     use_testnet: bool
+
+    @property
+    def base_asset(self) -> str:
+        return self.symbol.split("/")[0]            # "ETH" for "ETH/USDT:USDT"
+
+    @property
+    def settle_coin(self) -> str:
+        return self.symbol.split(":")[-1]           # "USDT" for "ETH/USDT:USDT"
 
     @staticmethod
     def load(path: str | Path) -> "StrategyConfig":
@@ -219,33 +226,35 @@ class PositionBook:
         return PositionBook(**d)
 
 
-def breakeven_net(book: PositionBook, taker_rate: float) -> Optional[float]:
-    """Price at which closing the WHOLE open position at market leaves the
-    current episode at exactly zero net: realized PnL of earlier reductions,
-    every fee paid, funding, and the taker fee of the closing order included.
-
-        SHORT: R + (A - p)*Q - f*p*Q = 0  =>  p = (R + A*Q) / (Q*(1 + f))
-        LONG:  R + (p - A)*Q - f*p*Q = 0  =>  p = (A*Q - R) / (Q*(1 - f))
-    """
-    if book.is_flat:
-        return None
-    q, a, r, f = book.qty, book.avg_entry, book.realized_net, taker_rate
-    if book.side == SHORT:
-        return (r + a * q) / (q * (1.0 + f))
-    return (a * q - r) / (q * (1.0 - f))
+def breakeven(book: PositionBook) -> Optional[float]:
+    """Break-even used for the reversal rule: the plain AVERAGE ENTRY price of
+    the open net position -- fees and funding deliberately NOT included (they
+    are still tracked in the episode's realized net)."""
+    return None if book.is_flat else book.avg_entry
 
 
-def reversal_signal(mode: str, book: PositionBook, price: float, reversal_pct: float,
-                    taker_rate: float) -> Optional[str]:
-    """New active direction if the net position is `reversal_pct`% in profit
-    past its net break-even and the bot is not already firing against it;
-    None otherwise."""
-    be = breakeven_net(book, taker_rate)
+def reversal_thresholds(book: PositionBook, reversal_pct: float) -> Optional[tuple]:
+    """(long_below, short_above): fire LONG at/below the first price, SHORT
+    at/above the second. None when flat."""
+    be = breakeven(book)
     if be is None:
         return None
-    if book.side == SHORT and price <= be * (1.0 - reversal_pct / 100.0):
+    return be * (1.0 - reversal_pct / 100.0), be * (1.0 + reversal_pct / 100.0)
+
+
+def reversal_signal(mode: str, book: PositionBook, price: float, reversal_pct: float) -> Optional[str]:
+    """Symmetric rule on price vs break-even, whatever the position's side:
+        price <= BE * (1 - pct)  -> fire LONG
+        price >= BE * (1 + pct)  -> fire SHORT
+        in between               -> keep the current direction
+    Returns the new direction only if it differs from `mode`, else None."""
+    th = reversal_thresholds(book, reversal_pct)
+    if th is None:
+        return None
+    long_below, short_above = th
+    if price <= long_below:
         target = LONG
-    elif book.side == LONG and price >= be * (1.0 + reversal_pct / 100.0):
+    elif price >= short_above:
         target = SHORT
     else:
         return None
