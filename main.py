@@ -203,7 +203,10 @@ class TrxBot:
             st.base_notional = await self._compute_base_notional(price, last_base=st.base_notional, verbose=False)
         side = order_side_for(st.mode)
         qty = qty_for_notional(st.base_notional, price, self.exchange.qty_step(), self.exchange.min_order_qty(),
-                               min_notional=self._min_order_value * MIN_ORDER_MARGIN)
+                               # margin only on the minimum ORDER VALUE (e.g. 5 USDT): the minimum QTY is
+                               # already enforced by min_order_qty and must not be bumped a whole step
+                               min_notional=(self.exchange.min_order_notional() or FALLBACK_MIN_ORDER_VALUE)
+                               * MIN_ORDER_MARGIN)
         try:
             filled = await self.exchange.place_market_order(side, qty)
         except Exception:

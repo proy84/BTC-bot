@@ -208,3 +208,19 @@ def test_order_size_follows_equity_before_every_order(bot):
         assert ex.orders[-1][1] == 50
 
     asyncio.run(run())
+
+
+def test_eth_minimum_qty_is_not_bumped_a_whole_step(bot):
+    """Regression (30/09): 1% of 3348 = 33.49 USDT at 2730.86 -> 0.01 ETH (27.31),
+    NOT 0.02: the safety margin applies to the 5 USDT minimum order value only."""
+    ex = bot.exchange
+    ex.price, ex.equity = 2730.86, 3348.52
+    ex.min_order_qty = lambda: 0.01
+    ex.qty_step = lambda: 0.01
+    ex.min_order_notional = lambda: 5.0
+
+    async def run():
+        await bot._bootstrap()
+        assert ex.orders[-1][1] == pytest.approx(0.01)
+
+    asyncio.run(run())
