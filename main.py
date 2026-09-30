@@ -109,10 +109,9 @@ class TrxBot:
             await self._fire_order(price)  # "all'avvio apre la posizione"
         else:
             price = await self.exchange.fetch_last_price()
-            base = await self._compute_base_notional(price)
-            if not self.cfg.equity_based_sizing_enabled and abs(base - self.state.base_notional) > 1e-9:
-                # fixed-size mode (e.g. exchange minimum): a config change applies on restart
-                logger.info("Importo per ordine aggiornato da config: %.2f -> %.2f %s.",
+            base = await self._compute_base_notional(price, last_base=self.state.base_notional)
+            if abs(base - self.state.base_notional) > 1e-9:
+                logger.info("Importo per ordine aggiornato: %.2f -> %.2f %s.",
                             self.state.base_notional, base, self.cfg.settle_coin)
                 self.state.base_notional = base
         self._save_state()
@@ -138,7 +137,13 @@ class TrxBot:
         except OSError:
             logger.exception("Salvataggio stato %s fallito", self.runtime_state_path)
 
-    async def _compute_base_notional(self, price: float) -> float:
+    async def _compute_base_notional(self, price: float, last_base: Optional[float] = None,
+                                     verbose: bool = True) -> float:
+        """Order size. Equity sizing ON: `percentage`% of the CURRENT total
+        equity (called before every order, so it follows the account up and
+        down); if the equity read fails, `last_base` is kept. Equity sizing
+        OFF: fixed `base_notional_usd` (0 = exchange minimum). Never below the
+        exchange minimum order value."""
         min_value = max(self.exchange.min_order_notional() or FALLBACK_MIN_ORDER_VALUE,
                         self.exchange.min_order_qty() * price)
         self._min_order_value = min_value
@@ -147,11 +152,16 @@ class TrxBot:
             try:
                 equity = await self.exchange.fetch_total_equity()
             except Exception:
-                logger.exception("Lettura equity fallita: uso base_notional_usd=%.2f.", self.cfg.base_notional_usd)
+                logger.warning("Lettura equity fallita.", exc_info=True)
+            if equity <= 0 and last_base is not None:
+                logger.warning("Equity non disponibile: tengo l'importo precedente %.2f %s.", last_base,
+                               self.cfg.settle_coin)
+                return last_base
         base = base_notional_from_equity(equity, self.cfg.equity_based_sizing_percentage,
                                          self.cfg.base_notional_usd, min_value)
-        logger.info("Importo per ordine: %.2f %s (equity %.2f x %.2f%%, minimo exchange %.2f).",
-                    base, self.cfg.settle_coin, equity, self.cfg.equity_based_sizing_percentage, min_value)
+        (logger.info if verbose else logger.debug)(
+            "Importo per ordine: %.2f %s (equity %.2f x %.2f%%, minimo exchange %.2f).",
+            base, self.cfg.settle_coin, equity, self.cfg.equity_based_sizing_percentage, min_value)
         return base
 
     def _book_from_exchange(self, pos, episode_id: int) -> PositionBook:
@@ -188,6 +198,9 @@ class TrxBot:
     async def _fire_order(self, price: float) -> None:
         st = self.state
         st.last_order_ts = self.now()  # one attempt per timeframe, even if it fails
+        if self.cfg.equity_based_sizing_enabled:
+            # re-read the equity before EVERY order: the size follows the account
+            st.base_notional = await self._compute_base_notional(price, last_base=st.base_notional, verbose=False)
         side = order_side_for(st.mode)
         qty = qty_for_notional(st.base_notional, price, self.exchange.qty_step(), self.exchange.min_order_qty(),
                                min_notional=self._min_order_value * MIN_ORDER_MARGIN)

@@ -19,6 +19,7 @@ class FakeExchange:
         self.price = 0.30
         self.side, self.qty, self.entry = None, 0.0, 0.0
         self.orders = []
+        self.equity = 3300.0
 
     async def setup(self):
         pass
@@ -39,7 +40,7 @@ class FakeExchange:
         return 1.0
 
     async def fetch_total_equity(self):
-        return 3300.0
+        return self.equity
 
     async def fetch_realized_funding(self, symbol=None, since_ms=None, limit=50):
         return []
@@ -164,10 +165,11 @@ def test_restart_resumes_state(bot, tmp_path):
 
 
 def test_minimum_order_sizing(tmp_path, monkeypatch):
-    """Current config: equity sizing off, base_notional_usd 0 -> exchange minimum (5 USDC)."""
+    """Equity sizing off, base_notional_usd 0 -> exchange minimum (5)."""
     monkeypatch.setattr(bot_main, "ExchangeClient", FakeExchange)
     cfg = dataclasses.replace(
         StrategyConfig.load("config.json"), notifier_enabled=False, use_testnet=True,
+        equity_based_sizing_enabled=False, base_notional_usd=0.0,
         trade_history_path=str(tmp_path / "h.json"), state_export_path=str(tmp_path / "l.json"),
         runtime_state_path=str(tmp_path / "s.json"),
     )
@@ -179,5 +181,30 @@ def test_minimum_order_sizing(tmp_path, monkeypatch):
         assert bot.state.base_notional == pytest.approx(5.0)
         side, qty, price = bot.exchange.orders[0]
         assert side == "sell" and qty == 17 and qty * price >= 5.0   # 5 / 0.30 = 16.7 -> 17 TRX
+
+    asyncio.run(run())
+
+
+def test_order_size_follows_equity_before_every_order(bot):
+    """Current config: 1% of the equity re-read before EVERY order."""
+    assert bot.cfg.equity_based_sizing_enabled
+    ex = bot.exchange
+
+    async def run():
+        await bot._bootstrap()
+        assert ex.orders[-1][1] == 110                 # 1% of 3300 = 33 -> 110 at 0.30
+        ex.equity = 6600.0                             # account doubled
+        bot.now.t = 661.0
+        await bot._tick()
+        assert ex.orders[-1][1] == 220                 # 1% of 6600 = 66 -> 220
+        assert bot.state.base_notional == pytest.approx(66.0)
+        ex.equity = 1500.0                             # drawdown
+        bot.now.t = 722.0
+        await bot._tick()
+        assert ex.orders[-1][1] == 50                  # 1% of 1500 = 15 -> 50
+        ex.equity = 0.0                                # equity read unavailable -> keep previous size
+        bot.now.t = 783.0
+        await bot._tick()
+        assert ex.orders[-1][1] == 50
 
     asyncio.run(run())

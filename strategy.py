@@ -6,13 +6,13 @@ linear perpetual (currently ETH/USDT, 150x). No network/exchange dependency by
 design: exchange I/O lives in `exchange.py`, orchestration in `main.py`.
 
 Rules:
-  - At startup the bot opens a SHORT of `base notional`: the exchange minimum
-    order value with the current config (`base_notional_usd` = 0, equity
-    sizing off -- on ETHUSDT that is the 0.01 ETH minimum qty); otherwise a
-    fixed amount or a percentage of total equity.
+  - At startup the bot opens a SHORT of `base notional` = `percentage`% (1%)
+    of the account's total equity, RE-READ BEFORE EVERY ORDER (current
+    config), never below the exchange minimum (0.01 ETH on ETHUSDT). With
+    equity sizing off: fixed `base_notional_usd` (0 = exchange minimum).
   - Every timeframe (1m) -- counted from the PREVIOUS order, not aligned to
-    the clock -- it fires one more market order of the same base notional in
-    the ACTIVE DIRECTION (initially short).
+    the clock -- it fires one more market order of base notional in the
+    ACTIVE DIRECTION (initially short).
   - One-way mode: there is a single NET position. Orders in the direction
     opposite to the position reduce it (and flip it if they exceed it).
   - Reversal, symmetric on price vs BREAK-EVEN = plain average entry of the

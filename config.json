@@ -26,9 +26,9 @@
     "maker_rate": 0.0002
   },
 
-  "_comment_sizing": "Importo di ogni ordine. Config attuale: equity_based_sizing disattivato e base_notional_usd = 0 -> ogni ordine al MINIMO consentito da Bybit (su ETHUSDT la qty minima 0.01 ETH, circa 27 USDT; ordine minimo 5 USDT), quantita' arrotondata per eccesso cosi' non scende mai sotto il minimo. base_notional_usd > 0 -> importo fisso (mai sotto il minimo). equity_based_sizing.enabled = true -> percentage% dell'equity letto al primo avvio.",
+  "_comment_sizing": "Importo di ogni ordine. Config attuale: equity_based_sizing.enabled = true -> ogni ordine = percentage% (1%) dell'equity totale reale (totalEquity Bybit), RILETTA PRIMA DI OGNI ORDINE: se l'equity cresce l'ordine cresce, se scende scende (l'equity include anche il PnL non realizzato). Su ETHUSDT la quantita' va a scatti di 0.01 ETH (~27 USDT): con ~3.300 di equity l'1% (33) diventa 0.01 ETH, sale a 0.02 ETH da ~4.100 di equity. Mai sotto il minimo exchange. Se la lettura dell'equity fallisce si tiene l'importo precedente. enabled = false -> importo fisso base_notional_usd (0 = minimo exchange).",
   "equity_based_sizing": {
-    "enabled": false,
+    "enabled": true,
     "percentage": 1.0
   },
   "base_notional_usd": 0,

@@ -11,8 +11,8 @@ Lavora su **Bybit Demo Trading** (`USE_TESTNET=true` in `.env`, default).
 
 ## 1. Strategia
 
-1. **Avvio**: apre subito uno **SHORT** a mercato dell'**importo minimo consentito** (su ETHUSDT la quantità minima è 0,01 ETH ≈ 27 USDT; config `base_notional_usd: 0`, `equity_based_sizing.enabled: false`). Quantità arrotondata per eccesso, mai sotto il minimo.
-2. **Ogni minuto** — contato **dall'ordine precedente** (60 s) — spara **un ordine a mercato dello stesso importo** nella **direzione attiva**.
+1. **Avvio**: apre subito uno **SHORT** a mercato di importo = **1% dell'equity totale** del conto (`equity_based_sizing.enabled: true`, `percentage: 1.0`), mai sotto il minimo exchange (0,01 ETH ≈ 27 USDT su ETHUSDT).
+2. **Ogni minuto** — contato **dall'ordine precedente** (60 s) — spara **un ordine a mercato** nella **direzione attiva**. L'importo è **ricalcolato prima di ogni ordine** sull'equity di quel momento: se l'equity cresce (guadagni) l'ordine cresce, se scende l'ordine scende (l'equity include anche il PnL non realizzato). Su ETHUSDT la quantità va a scatti di 0,01 ETH: con ~3.300 di equity l'1% (33 USDT) diventa 0,01 ETH; si passa a 0,02 ETH da ~4.100 di equity, a 0,03 da ~6.800. Se la lettura dell'equity fallisce si usa l'importo precedente.
 3. **Posizione netta one-way**: gli ordini opposti alla posizione la **riducono** (il guadagno/perdita della parte ridotta viene **realizzato**, cioè incassato nel saldo); se la superano la posizione **cambia segno**.
 4. **Inversione** — regola **simmetrica sul prezzo**, con **breakeven = prezzo medio d'ingresso** della posizione netta, **senza fee né funding** (`reversal_pct` = 0,5%):
    - prezzo ≤ BE × (1 − 0,5%) → da quel minuto si sparano **LONG**;
@@ -69,8 +69,8 @@ Avvio: `python main.py` · Test: `python -m pytest` · Log dettagliati: `LOG_LEV
 | `initial_direction` | `short` | direzione del primo ordine |
 | `reversal_pct` | 0.5 | % di prezzo sotto/sopra il breakeven (prezzo medio, senza fee) che fa sparare LONG/SHORT |
 | `fees.taker_rate` / `maker_rate` | 0.00055 / 0.0002 | per stime (le fee reali vengono dai fill) |
-| `equity_based_sizing.enabled` / `percentage` | false / 1.0 | se true: importo per ordine = % dell'equity al primo avvio |
-| `base_notional_usd` | 0 | 0 = minimo exchange (0,01 ETH ≈ 27 USDT); > 0 = importo fisso (mai sotto il minimo). In modalità fissa il valore viene riletto a ogni riavvio |
+| `equity_based_sizing.enabled` / `percentage` | true / 1.0 | importo per ordine = % dell'equity, riletta prima di OGNI ordine |
+| `base_notional_usd` | 0 | usato solo con equity sizing spento: 0 = minimo exchange (0,01 ETH ≈ 27 USDT); > 0 = importo fisso |
 | `notifier.enabled` | true | Telegram (richiede le variabili in `.env`) |
 | `polling.tick_poll_interval_sec` | 2 | frequenza del tick |
 | `polling.funding_poll_interval_sec` | 300 | frequenza lettura funding |
